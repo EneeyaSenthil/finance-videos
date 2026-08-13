@@ -26,6 +26,7 @@ final video, not an earlier draft.
 """
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from moviepy import (
     TextClip,
     VideoClip,
 )
+from moviepy.video.fx import CrossFadeIn, CrossFadeOut
 
 BOLD_FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/google-fonts/Poppins-Bold.ttf",
@@ -133,32 +135,83 @@ def split_sentences(text):
 
 
 def generate_image_for_sentence(sentence, out_path, width, height):
+    """
+    Returns the path on success, or None if every real option failed.
+    NEVER writes a placeholder -- a placeholder in the final video is
+    treated as unacceptable output, not a fallback.
+    """
+    import time
+
+    prompt = f"professional high quality finance economics b-roll cinematic photo, illustrating: {sentence}, no text, no watermark"
+
+    # --- Option 1: Pollinations.ai (free, no key, rate-paced) ---
     try:
         import urllib.parse
         import urllib.request
 
-        prompt = f"professional high quality finance economics b-roll cinematic photo, illustrating: {sentence}, no text, no watermark"
         encoded = urllib.parse.quote(prompt)
         url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true"
-        urllib.request.urlretrieve(url, out_path)
-        if Path(out_path).stat().st_size > 1000:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            },
+        )
+        with urllib.request.urlopen(req, timeout=30) as response, open(out_path, "wb") as f:
+            f.write(response.read())
+        size = Path(out_path).stat().st_size
+        if 10_000 < size < 1_000_000:
+            time.sleep(15)
             return out_path
+        else:
+            print(f"      [Pollinations suspicious size ({size} bytes) -- likely rate-limited, trying next option]")
+            Path(out_path).unlink(missing_ok=True)
     except Exception as e:
-        print(f"      [image gen failed: {e} -- using placeholder]")
+        print(f"      [Pollinations request failed: {e} -- trying next option]")
 
-    img = Image.new("RGB", (width, height), (20, 30, 45))
-    draw = ImageDraw.Draw(img)
-    for y in range(height):
-        shade = int(20 + (y / height) * 40)
-        draw.line([(0, y), (width, y)], fill=(shade, shade + 10, shade + 25))
-    img.save(out_path)
-    return out_path
+    # --- Option 2: Hugging Face Inference API (free, needs HF_API_TOKEN) ---
+    hf_token = os.environ.get("HF_API_TOKEN")
+    if hf_token:
+        try:
+            import urllib.request
+
+            hf_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+            req = urllib.request.Request(
+                hf_url,
+                headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            req.data = f'{{"inputs": {prompt!r}}}'.encode("utf-8")
+            with urllib.request.urlopen(req, timeout=60) as response:
+                data = response.read()
+            if len(data) > 10_000:
+                with open(out_path, "wb") as f:
+                    f.write(data)
+                return out_path
+            else:
+                print("      [Hugging Face returned unexpectedly small data]")
+        except Exception as e:
+            print(f"      [Hugging Face request failed: {e}]")
+    else:
+        print("      [HF_API_TOKEN not set -- Hugging Face fallback unavailable]")
+
+    # --- Both real options failed. Do NOT create a placeholder. ---
+    return None
 
 
-def ken_burns_clip(image_path, duration, width, height, zoom_in=True):
+def ken_burns_clip(image_path, duration, width, height, zoom_in=True, pan="center"):
+    """
+    Ken Burns effect with both zoom AND a slight directional pan, for a more
+    dynamic, engaging feel than a static center zoom alone.
+    """
     img = Image.open(image_path).convert("RGB").resize((width, height))
     arr = np.array(img)
-    start_scale, end_scale = (1.0, 1.12) if zoom_in else (1.12, 1.0)
+    start_scale, end_scale = (1.0, 1.15) if zoom_in else (1.15, 1.0)
+
+    pan_offsets = {
+        "left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1), "center": (0, 0),
+    }
+    dx, dy = pan_offsets.get(pan, (0, 0))
 
     def make_frame(t):
         frac = t / duration if duration > 0 else 0
@@ -166,7 +219,12 @@ def ken_burns_clip(image_path, duration, width, height, zoom_in=True):
         h, w = arr.shape[:2]
         new_h, new_w = int(h * scale), int(w * scale)
         frame_img = Image.fromarray(arr).resize((new_w, new_h))
-        left, top = (new_w - w) // 2, (new_h - h) // 2
+        max_shift_x = (new_w - w) // 2
+        max_shift_y = (new_h - h) // 2
+        left = (new_w - w) // 2 + int(dx * max_shift_x * frac)
+        top = (new_h - h) // 2 + int(dy * max_shift_y * frac)
+        left = max(0, min(left, new_w - w))
+        top = max(0, min(top, new_h - h))
         return np.array(frame_img.crop((left, top, left + w, top + h)))
 
     return VideoClip(make_frame, duration=duration)
@@ -210,23 +268,40 @@ def main():
 
     script_text = Path(args.script).read_text(encoding="utf-8")
 
-    # Step 1-3: audio chain
+    # --- Step 1-3: audio chain, RESUMABLE -- skip any stage already done ---
     narration_raw = workdir / "narration_raw.wav"
     narration_boosted = workdir / "narration_boosted.wav"
     final_audio = workdir / "final_audio.mp3"
 
-    generate_narration(script_text, args.voice, narration_raw)
-    boost_volume(narration_raw, narration_boosted)
-
-    if args.music:
-        mix_music(narration_boosted, args.music, final_audio, args.music_volume)
+    if narration_raw.exists():
+        print(f"[1/6] Narration already exists, skipping: {narration_raw}")
     else:
-        subprocess.run(["ffmpeg", "-y", "-i", str(narration_boosted), str(final_audio)], check=True, capture_output=True)
+        generate_narration(script_text, args.voice, narration_raw)
 
-    # Step 4: whisper timing on the FINAL mixed audio
-    timings = get_word_timings(final_audio)
+    if narration_boosted.exists():
+        print(f"[2/6] Boosted narration already exists, skipping: {narration_boosted}")
+    else:
+        boost_volume(narration_raw, narration_boosted)
 
-    # Step 5: images + motion, timed against sentences spread across real audio duration
+    if final_audio.exists():
+        print(f"[3/6] Final mixed audio already exists, skipping: {final_audio}")
+    else:
+        if args.music:
+            mix_music(narration_boosted, args.music, final_audio, args.music_volume)
+        else:
+            subprocess.run(["ffmpeg", "-y", "-i", str(narration_boosted), str(final_audio)], check=True, capture_output=True)
+
+    # --- Step 4: whisper timing, RESUMABLE -- cache to a json file ---
+    import json
+    timings_cache = workdir / "timings.json"
+    if timings_cache.exists():
+        print(f"[4/6] Caption timings already exist, skipping transcription: {timings_cache}")
+        timings = json.loads(timings_cache.read_text())
+    else:
+        timings = get_word_timings(final_audio)
+        timings_cache.write_text(json.dumps(timings))
+
+    # --- Step 5: images, RESUMABLE per-sentence -- and STOPS (no placeholder) on failure ---
     audio_clip = AudioFileClip(str(final_audio))
     duration = audio_clip.duration
     sentences = split_sentences(script_text)
@@ -235,21 +310,51 @@ def main():
     print(f"[5/6] Generating {len(sentences)} images with Ken Burns motion...")
     beat_clips = []
     t_cursor = 0.0
+    pans = ["left", "right", "up", "down"]
     for i, sentence in enumerate(sentences):
         weight = len(sentence.split()) / total_words
         beat_duration = max(1.0, duration * weight)
         if t_cursor + beat_duration > duration:
             beat_duration = max(0.5, duration - t_cursor)
+
         img_path = workdir / f"beat_{i:03d}.png"
-        generate_image_for_sentence(sentence, img_path, width, height)
-        beat_clips.append(ken_burns_clip(img_path, beat_duration, width, height, zoom_in=(i % 2 == 0)))
+        if img_path.exists():
+            print(f"      [{i+1}/{len(sentences)}] already generated, skipping: {img_path.name}")
+        else:
+            print(f"      [{i+1}/{len(sentences)}] generating image for sentence {i+1}...")
+            result = generate_image_for_sentence(sentence, img_path, width, height)
+            if result is None:
+                print(
+                    f"\nSTOPPED at sentence {i+1}/{len(sentences)}: both Pollinations and Hugging Face "
+                    f"failed to generate a real image for this sentence.\n"
+                    f"No placeholder was used -- nothing unusable will end up in your video.\n"
+                    f"Everything completed so far (narration, music, captions, and "
+                    f"{i} earlier images) is saved in '{args.workdir}/' and will be reused automatically.\n"
+                    f"Just run this exact same command again in a little while -- it will pick up\n"
+                    f"right here at sentence {i+1} instead of starting over.\n"
+                )
+                sys.exit(1)
+
+        beat_clips.append(
+            ken_burns_clip(img_path, beat_duration, width, height, zoom_in=(i % 2 == 0), pan=pans[i % len(pans)])
+        )
         t_cursor += beat_duration
         if t_cursor >= duration:
             break
 
-    # Step 6: assemble
+    # --- Step 6: assemble with crossfade transitions between beats ---
     print("[6/6] Compositing captions and rendering final video...")
-    background = concatenate_videoclips(beat_clips, method="compose").with_duration(duration)
+    CROSSFADE = 0.5  # seconds of overlap between consecutive images
+    faded_clips = []
+    for i, clip in enumerate(beat_clips):
+        c = clip
+        if i > 0:
+            c = c.with_effects([CrossFadeIn(CROSSFADE)])
+        if i < len(beat_clips) - 1:
+            c = c.with_effects([CrossFadeOut(CROSSFADE)])
+        faded_clips.append(c)
+
+    background = concatenate_videoclips(faded_clips, method="compose", padding=-CROSSFADE).with_duration(duration)
     caption_clips = build_caption_clips(timings, width, height)
     final = CompositeVideoClip([background] + caption_clips, size=(width, height)).with_duration(duration)
     final = final.with_audio(audio_clip)
