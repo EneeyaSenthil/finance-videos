@@ -311,12 +311,20 @@ def main():
     beat_clips = []
     t_cursor = 0.0
     pans = ["left", "right", "up", "down"]
+    beat_targets = []  # (index, sentence, beat_duration) -- compute all targets first
     for i, sentence in enumerate(sentences):
         weight = len(sentence.split()) / total_words
         beat_duration = max(1.0, duration * weight)
         if t_cursor + beat_duration > duration:
             beat_duration = max(0.5, duration - t_cursor)
+        beat_targets.append((i, sentence, beat_duration))
+        t_cursor += beat_duration
+        if t_cursor >= duration:
+            break
 
+    CROSSFADE = 0.5  # seconds of overlap between consecutive images
+    n_beats = len(beat_targets)
+    for idx, (i, sentence, beat_duration) in enumerate(beat_targets):
         img_path = workdir / f"beat_{i:03d}.png"
         if img_path.exists():
             print(f"      [{i+1}/{len(sentences)}] already generated, skipping: {img_path.name}")
@@ -329,22 +337,23 @@ def main():
                     f"failed to generate a real image for this sentence.\n"
                     f"No placeholder was used -- nothing unusable will end up in your video.\n"
                     f"Everything completed so far (narration, music, captions, and "
-                    f"{i} earlier images) is saved in '{args.workdir}/' and will be reused automatically.\n"
+                    f"{idx} earlier images) is saved in '{args.workdir}/' and will be reused automatically.\n"
                     f"Just run this exact same command again in a little while -- it will pick up\n"
                     f"right here at sentence {i+1} instead of starting over.\n"
                 )
                 sys.exit(1)
 
+        # Add back the time the crossfade will consume, so the FINAL visible
+        # duration on screen still equals beat_duration -- this is what keeps
+        # total visuals in sync with the full audio length, no trailing blank gap.
+        extra = CROSSFADE if idx < n_beats - 1 else 0
+        clip_duration = beat_duration + extra
         beat_clips.append(
-            ken_burns_clip(img_path, beat_duration, width, height, zoom_in=(i % 2 == 0), pan=pans[i % len(pans)])
+            ken_burns_clip(img_path, clip_duration, width, height, zoom_in=(i % 2 == 0), pan=pans[i % len(pans)])
         )
-        t_cursor += beat_duration
-        if t_cursor >= duration:
-            break
 
     # --- Step 6: assemble with crossfade transitions between beats ---
     print("[6/6] Compositing captions and rendering final video...")
-    CROSSFADE = 0.5  # seconds of overlap between consecutive images
     faded_clips = []
     for i, clip in enumerate(beat_clips):
         c = clip
