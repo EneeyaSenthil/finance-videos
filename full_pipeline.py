@@ -157,7 +157,7 @@ def generate_image_for_sentence(sentence, out_path, width, height):
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             },
         )
-        with urllib.request.urlopen(req, timeout=30) as response, open(out_path, "wb") as f:
+        with urllib.request.urlopen(req, timeout=60) as response, open(out_path, "wb") as f:
             f.write(response.read())
         size = Path(out_path).stat().st_size
         if 10_000 < size < 1_000_000:
@@ -175,7 +175,7 @@ def generate_image_for_sentence(sentence, out_path, width, height):
         try:
             import urllib.request
 
-            hf_url = "https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell"
+            hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
             req = urllib.request.Request(
                 hf_url,
                 headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
