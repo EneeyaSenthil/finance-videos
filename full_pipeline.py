@@ -26,6 +26,7 @@ final video, not an earlier draft.
 """
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -129,12 +130,96 @@ def get_word_timings(audio_path):
 # ---------------------------------------------------------------------------
 # STEP 5: One image per sentence (free, no key) + Ken Burns motion
 # ---------------------------------------------------------------------------
+def generate_style_guide(script_text, workdir):
+    """
+    Reads the WHOLE script once and generates a short visual style brief --
+    color palette, mood, tone, recurring motifs -- so every sentence's image
+    shares one coherent identity instead of being generated in isolation.
+
+    Cached to disk (resumable like every other stage). Does NOT silently
+    fall back to a generic default -- if generation fails, that's a real
+    problem worth surfacing and fixing, not papering over.
+    """
+    cache_path = workdir / "style_guide.txt"
+    if cache_path.exists():
+        print(f"[0/6] Style guide already exists, skipping: {cache_path}")
+        return cache_path.read_text(encoding="utf-8")
+
+    print("[0/6] Generating a visual style guide from your script...")
+
+    hf_token = os.environ.get("HF_API_TOKEN")
+    if not hf_token:
+        print(
+            "\nSTOPPED: HF_API_TOKEN is not set, so a style guide can't be generated.\n"
+            "Set it with: export HF_API_TOKEN=\"your-token-here\"\n"
+            "Then run this exact same command again -- narration, audio, and captions\n"
+            "are already saved and will be reused automatically.\n"
+        )
+        sys.exit(1)
+
+    try:
+        import urllib.request
+
+        prompt = (
+            "You are a visual style consultant for a YouTube documentary channel made "
+            "for an American audience. Read this video script and write a SHORT visual "
+            "style brief (under 100 words) covering: a specific color palette (2-3 colors), "
+            "the overall mood/tone, and what kind of real, everyday American settings would "
+            "fit this story (not abstract or generic). The style must read as authentically "
+            "American and photorealistic -- explicitly avoid anything that looks like typical "
+            "AI-generated art (no glossy/uncanny lighting, no surreal composition, no digital "
+            "illustration look). Output ONLY the style brief, no preamble.\n\n"
+            f"SCRIPT:\n{script_text[:2000]}"
+        )
+
+        hf_url = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
+        req = urllib.request.Request(
+            hf_url,
+            headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        payload = json.dumps({
+            "inputs": prompt,
+            "parameters": {"max_new_tokens": 150, "temperature": 0.7},
+        })
+        req.data = payload.encode("utf-8")
+        with urllib.request.urlopen(req, timeout=60) as response:
+            result = json.loads(response.read())
+
+        generated = result[0]["generated_text"] if isinstance(result, list) else result.get("generated_text", "")
+        if prompt in generated:
+            generated = generated.replace(prompt, "").strip()
+
+        if len(generated) > 20:
+            print(f"      Style guide generated ({len(generated)} chars)")
+            cache_path.write_text(generated, encoding="utf-8")
+            return generated
+        else:
+            print(
+                f"\nSTOPPED: the style guide came back too short/empty ({len(generated)} chars) "
+                f"to be usable.\nThis usually means the model returned something unexpected -- "
+                f"worth checking manually before continuing.\nRaw response: {generated!r}\n"
+                f"Run this exact same command again once you've investigated -- everything\n"
+                f"completed so far is saved and will be reused automatically.\n"
+            )
+            sys.exit(1)
+
+    except Exception as e:
+        print(
+            f"\nSTOPPED: style guide generation failed with an error: {e}\n"
+            f"This needs to be looked at rather than silently working around it.\n"
+            f"Run this exact same command again once it's fixed -- everything completed\n"
+            f"so far (narration, audio, captions) is saved and will be reused automatically.\n"
+        )
+        sys.exit(1)
+
+
 def split_sentences(text):
     text = re.sub(r"\s+", " ", text).strip()
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
-def generate_image_for_sentence(sentence, out_path, width, height):
+def generate_image_for_sentence(sentence, out_path, width, height, index=0, style_guide=""):
     """
     Returns the path on success, or None if every real option failed.
     NEVER writes a placeholder -- a placeholder in the final video is
@@ -142,7 +227,15 @@ def generate_image_for_sentence(sentence, out_path, width, height):
     """
     import time
 
-    prompt = f"professional high quality finance economics b-roll cinematic photo, illustrating: {sentence}, no text, no watermark"
+    shot_types = ["wide establishing shot", "close-up detail shot", "medium shot", "aerial view", "over-the-shoulder shot"]
+    shot = shot_types[index % len(shot_types)]
+    style_block = f" {style_guide.strip()}" if style_guide else ""
+    prompt = (
+        f"{shot}, illustrating: {sentence}, set in America, authentic American "
+        f"setting and people.{style_block} "
+        f"photorealistic, shot on DSLR camera, natural lighting, real photography, "
+        f"no illustration, no digital art, no CGI, no text, no watermark"
+    )
 
     # --- Option 1: Pollinations.ai (free, no key, rate-paced) ---
     try:
@@ -235,7 +328,7 @@ def ken_burns_clip(image_path, duration, width, height, zoom_in=True, pan="cente
 # ---------------------------------------------------------------------------
 def build_caption_clips(timings, width, height, accent="#f9c74f"):
     clips = []
-    caption_y = int(height * 0.80)
+    caption_y = int(height * 0.72)  # moved up from 0.80 for a more eye-friendly position
     for word, start, end in timings:
         clean = re.sub(r"[^\w'.,%-]", "", word)
         if not clean:
@@ -292,7 +385,6 @@ def main():
             subprocess.run(["ffmpeg", "-y", "-i", str(narration_boosted), str(final_audio)], check=True, capture_output=True)
 
     # --- Step 4: whisper timing, RESUMABLE -- cache to a json file ---
-    import json
     timings_cache = workdir / "timings.json"
     if timings_cache.exists():
         print(f"[4/6] Caption timings already exist, skipping transcription: {timings_cache}")
@@ -300,6 +392,9 @@ def main():
     else:
         timings = get_word_timings(final_audio)
         timings_cache.write_text(json.dumps(timings))
+
+    # --- Step 0 (runs here, before images): generate the video's style guide ---
+    style_guide = generate_style_guide(script_text, workdir)
 
     # --- Step 5: images, RESUMABLE per-sentence -- and STOPS (no placeholder) on failure ---
     audio_clip = AudioFileClip(str(final_audio))
@@ -330,7 +425,7 @@ def main():
             print(f"      [{i+1}/{len(sentences)}] already generated, skipping: {img_path.name}")
         else:
             print(f"      [{i+1}/{len(sentences)}] generating image for sentence {i+1}...")
-            result = generate_image_for_sentence(sentence, img_path, width, height)
+            result = generate_image_for_sentence(sentence, img_path, width, height, index=i, style_guide=style_guide)
             if result is None:
                 print(
                     f"\nSTOPPED at sentence {i+1}/{len(sentences)}: both Pollinations and Hugging Face "
