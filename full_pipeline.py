@@ -172,23 +172,23 @@ def generate_style_guide(script_text, workdir):
             f"SCRIPT:\n{script_text[:2000]}"
         )
 
-        hf_url = "https://router.huggingface.co/hf-inference/models/mistralai/Mistral-7B-Instruct-v0.2"
+        hf_url = "https://router.huggingface.co/v1/chat/completions"
         req = urllib.request.Request(
             hf_url,
             headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
             method="POST",
         )
         payload = json.dumps({
-            "inputs": prompt,
-            "parameters": {"max_new_tokens": 150, "temperature": 0.7},
+            "model": "meta-llama/Llama-3.1-8B-Instruct",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200,
+            "temperature": 0.7,
         })
         req.data = payload.encode("utf-8")
         with urllib.request.urlopen(req, timeout=60) as response:
             result = json.loads(response.read())
 
-        generated = result[0]["generated_text"] if isinstance(result, list) else result.get("generated_text", "")
-        if prompt in generated:
-            generated = generated.replace(prompt, "").strip()
+        generated = result["choices"][0]["message"]["content"].strip()
 
         if len(generated) > 20:
             print(f"      Style guide generated ({len(generated)} chars)")
