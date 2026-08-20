@@ -163,12 +163,16 @@ def generate_style_guide(script_text, workdir):
         prompt = (
             "You are a visual style consultant for a YouTube documentary channel made "
             "for an American audience. Read this video script and write a SHORT visual "
-            "style brief (under 100 words) covering: a specific color palette (2-3 colors), "
-            "the overall mood/tone, and what kind of real, everyday American settings would "
-            "fit this story (not abstract or generic). The style must read as authentically "
-            "American and photorealistic -- explicitly avoid anything that looks like typical "
-            "AI-generated art (no glossy/uncanny lighting, no surreal composition, no digital "
-            "illustration look). Output ONLY the style brief, no preamble.\n\n"
+            "brief (under 120 words). Start with a single line: 'TOPIC: ' followed by "
+            "3-6 words naming the concrete subject matter of this video (e.g. 'lettuce "
+            "contamination outbreak, grocery stores, stock market'). Then cover: a specific "
+            "color palette (2-3 colors), the overall mood/tone, and what kind of real, "
+            "everyday American settings would fit this story (not abstract or generic). "
+            "The style must read as authentically American and photorealistic -- explicitly "
+            "avoid anything that looks like typical AI-generated art (no glossy/uncanny "
+            "lighting, no surreal composition, no digital illustration look, no fashion "
+            "photography, no character portraits of models unless a specific real person is "
+            "named in the script). Output ONLY the brief, no preamble.\n\n"
             f"SCRIPT:\n{script_text[:2000]}"
         )
 
@@ -219,22 +223,139 @@ def split_sentences(text):
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
-def generate_image_for_sentence(sentence, out_path, width, height, index=0, style_guide=""):
+def call_llm(prompt, hf_token, max_tokens=200, temperature=0.7):
+    """Shared helper: one call to Llama 3.1 8B Instruct via Hugging Face's free router."""
+    import urllib.request
+
+    hf_url = "https://router.huggingface.co/v1/chat/completions"
+    req = urllib.request.Request(
+        hf_url,
+        headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    payload = json.dumps({
+        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    })
+    req.data = payload.encode("utf-8")
+    with urllib.request.urlopen(req, timeout=90) as response:
+        result = json.loads(response.read())
+    return result["choices"][0]["message"]["content"].strip()
+
+
+def generate_image_prompts(sentences, style_guide, script_text, workdir):
+    """
+    THE PART THAT WAS MISSING: reads the WHOLE script + the style guide, and
+    writes one specific, concrete, contextual image prompt PER SENTENCE --
+    not a generic template. This is what lets an abstract sentence like
+    "that gap between fear and actual risk" become a real, grounded scene
+    (e.g. a half-empty grocery produce aisle) instead of defaulting to a
+    random generic portrait.
+
+    Cached to disk (resumable). Does NOT silently fall back -- if this
+    fails, that's a real problem worth surfacing, same philosophy as the
+    style guide step.
+    """
+    cache_path = workdir / "image_prompts.json"
+    if cache_path.exists():
+        print(f"[0.5/6] Per-sentence image prompts already exist, skipping: {cache_path}")
+        return json.loads(cache_path.read_text())
+
+    print(f"[0.5/6] Writing a detailed, contextual image prompt for each of {len(sentences)} sentences...")
+
+    hf_token = os.environ.get("HF_API_TOKEN")
+    if not hf_token:
+        print(
+            "\nSTOPPED: HF_API_TOKEN is not set, so per-sentence prompts can't be written.\n"
+            "Set it with: export HF_API_TOKEN=\"your-token-here\"\n"
+            "Then run this exact same command again -- everything completed so far\n"
+            "is saved and will be reused automatically.\n"
+        )
+        sys.exit(1)
+
+    all_prompts = []
+    batch_size = 10
+    for batch_start in range(0, len(sentences), batch_size):
+        batch = sentences[batch_start:batch_start + batch_size]
+        batch_num = batch_start // batch_size + 1
+        total_batches = (len(sentences) + batch_size - 1) // batch_size
+        print(f"      Batch {batch_num}/{total_batches} ({len(batch)} sentences)...")
+
+        numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(batch))
+        prompt = (
+            "You are an expert visual director for an American YouTube documentary "
+            "channel. Here is the FULL SCRIPT for context, so you understand the whole "
+            f"story, its vibe, and what matters to an American audience:\n\n{script_text[:3000]}\n\n"
+            f"Here is the established visual STYLE GUIDE for this video:\n{style_guide}\n\n"
+            "Now write ONE detailed, concrete, photorealistic image-generation prompt for "
+            "EACH of the following sentences from that script. For each sentence: translate "
+            "any abstract idea, statistic, or transition into a real, specific, visualizable "
+            "American scene (not a person posing for a photo, not a fashion shot) that fits "
+            "naturally into the story at that point. Follow the style guide's palette and "
+            "mood. Only include a person if the sentence specifically requires showing someone "
+            "doing something functional (e.g. a shopper, a farmer, a CEO speaking) -- never a "
+            "generic portrait. Each prompt should be a single descriptive sentence, 15-30 words.\n\n"
+            f"SENTENCES:\n{numbered}\n\n"
+            f"Output ONLY a JSON array of exactly {len(batch)} strings, one prompt per sentence "
+            "in order, nothing else -- no markdown, no explanation."
+        )
+
+        try:
+            raw = call_llm(prompt, hf_token, max_tokens=900, temperature=0.7)
+            # Strip markdown code fences if the model wrapped its JSON in them
+            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+            batch_prompts = json.loads(cleaned)
+
+            if not isinstance(batch_prompts, list) or len(batch_prompts) != len(batch):
+                print(
+                    f"\nSTOPPED: batch {batch_num} returned {len(batch_prompts) if isinstance(batch_prompts, list) else 'invalid'} "
+                    f"prompts, expected exactly {len(batch)}.\n"
+                    f"This needs to be looked at rather than silently guessing or padding.\n"
+                    f"Raw response: {raw[:300]!r}\n"
+                    f"Run this exact same command again once it's fixed -- earlier batches\n"
+                    f"and everything else completed so far is saved and will be reused.\n"
+                )
+                cache_path.write_text(json.dumps(all_prompts))  # save partial progress
+                sys.exit(1)
+
+            all_prompts.extend(batch_prompts)
+
+        except Exception as e:
+            print(
+                f"\nSTOPPED: writing prompts for batch {batch_num} failed with an error: {e}\n"
+                f"This needs to be looked at rather than silently working around it.\n"
+                f"Run this exact same command again once it's fixed -- earlier batches and\n"
+                f"everything else completed so far is saved and will be reused automatically.\n"
+            )
+            cache_path.write_text(json.dumps(all_prompts))  # save partial progress
+            sys.exit(1)
+
+    cache_path.write_text(json.dumps(all_prompts))
+    print(f"      Wrote {len(all_prompts)} detailed, contextual prompts")
+    return all_prompts
+
+
+def generate_image_for_sentence(authored_prompt, out_path, width, height):
     """
     Returns the path on success, or None if every real option failed.
     NEVER writes a placeholder -- a placeholder in the final video is
     treated as unacceptable output, not a fallback.
+
+    `authored_prompt` comes from generate_image_prompts() -- a specific,
+    contextual prompt written by an LLM that read the whole script, not a
+    generic template. We still append a technical/safety suffix here as
+    cheap defense-in-depth, but the creative content is the LLM's.
     """
     import time
 
-    shot_types = ["wide establishing shot", "close-up detail shot", "medium shot", "aerial view", "over-the-shoulder shot"]
-    shot = shot_types[index % len(shot_types)]
-    style_block = f" {style_guide.strip()}" if style_guide else ""
     prompt = (
-        f"{shot}, illustrating: {sentence}, set in America, authentic American "
-        f"setting and people.{style_block} "
+        f"{authored_prompt} "
         f"photorealistic, shot on DSLR camera, natural lighting, real photography, "
-        f"no illustration, no digital art, no CGI, no text, no watermark"
+        f"no illustration, no digital art, no CGI, no text, no watermark, "
+        f"no fashion photography, no character portrait, no model posing, "
+        f"no stylized rendering, editorial photojournalism only"
     )
 
     # --- Option 1: Pollinations.ai (free, no key, rate-paced) ---
@@ -394,12 +515,15 @@ def main():
         timings_cache.write_text(json.dumps(timings))
 
     # --- Step 0 (runs here, before images): generate the video's style guide ---
+    sentences = split_sentences(script_text)
     style_guide = generate_style_guide(script_text, workdir)
+
+    # --- Step 0.5: write one contextual, detailed prompt PER SENTENCE ---
+    image_prompts = generate_image_prompts(sentences, style_guide, script_text, workdir)
 
     # --- Step 5: images, RESUMABLE per-sentence -- and STOPS (no placeholder) on failure ---
     audio_clip = AudioFileClip(str(final_audio))
     duration = audio_clip.duration
-    sentences = split_sentences(script_text)
     total_words = sum(len(s.split()) for s in sentences) or 1
 
     print(f"[5/6] Generating {len(sentences)} images with Ken Burns motion...")
@@ -425,7 +549,7 @@ def main():
             print(f"      [{i+1}/{len(sentences)}] already generated, skipping: {img_path.name}")
         else:
             print(f"      [{i+1}/{len(sentences)}] generating image for sentence {i+1}...")
-            result = generate_image_for_sentence(sentence, img_path, width, height, index=i, style_guide=style_guide)
+            result = generate_image_for_sentence(image_prompts[i], img_path, width, height)
             if result is None:
                 print(
                     f"\nSTOPPED at sentence {i+1}/{len(sentences)}: both Pollinations and Hugging Face "
