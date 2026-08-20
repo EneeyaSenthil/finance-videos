@@ -284,7 +284,7 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
         print(f"      Batch {batch_num}/{total_batches} ({len(batch)} sentences)...")
 
         numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(batch))
-        prompt = (
+        base_prompt = (
             "You are an expert visual director for an American YouTube documentary "
             "channel. Here is the FULL SCRIPT for context, so you understand the whole "
             f"story, its vibe, and what matters to an American audience:\n\n{script_text[:3000]}\n\n"
@@ -297,40 +297,53 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
             "mood. Only include a person if the sentence specifically requires showing someone "
             "doing something functional (e.g. a shopper, a farmer, a CEO speaking) -- never a "
             "generic portrait. Each prompt should be a single descriptive sentence, 15-30 words.\n\n"
-            f"SENTENCES:\n{numbered}\n\n"
-            f"Output ONLY a JSON array of exactly {len(batch)} strings, one prompt per sentence "
-            "in order, nothing else -- no markdown, no explanation."
+            f"SENTENCES (there are exactly {len(batch)} numbered sentences below -- count them):\n{numbered}\n\n"
+            f"Output ONLY a JSON array of EXACTLY {len(batch)} strings, one prompt per sentence "
+            f"in order, nothing else -- no markdown, no explanation. Before answering, recount: "
+            f"you must output precisely {len(batch)} array entries, not {len(batch)-1}, not {len(batch)+1}."
         )
 
-        try:
-            raw = call_llm(prompt, hf_token, max_tokens=900, temperature=0.7)
-            # Strip markdown code fences if the model wrapped its JSON in them
-            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-            batch_prompts = json.loads(cleaned)
-
-            if not isinstance(batch_prompts, list) or len(batch_prompts) != len(batch):
-                print(
-                    f"\nSTOPPED: batch {batch_num} returned {len(batch_prompts) if isinstance(batch_prompts, list) else 'invalid'} "
-                    f"prompts, expected exactly {len(batch)}.\n"
-                    f"This needs to be looked at rather than silently guessing or padding.\n"
-                    f"Raw response: {raw[:300]!r}\n"
-                    f"Run this exact same command again once it's fixed -- earlier batches\n"
-                    f"and everything else completed so far is saved and will be reused.\n"
+        batch_prompts = None
+        last_error_info = ""
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            prompt = base_prompt
+            if attempt > 1:
+                # Strengthen the correction on retries -- same trusted LLM, same
+                # task, just a clearer nudge. This is a retry, not a fallback.
+                prompt = (
+                    f"CORRECTION NEEDED: your previous attempt returned the wrong number of "
+                    f"array entries ({last_error_info}). You MUST return EXACTLY {len(batch)} "
+                    f"entries, no more, no less. Try again.\n\n" + base_prompt
                 )
-                cache_path.write_text(json.dumps(all_prompts))  # save partial progress
-                sys.exit(1)
+            try:
+                raw = call_llm(prompt, hf_token, max_tokens=900, temperature=0.5 if attempt == 1 else 0.3)
+                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+                parsed = json.loads(cleaned)
 
-            all_prompts.extend(batch_prompts)
+                if isinstance(parsed, list) and len(parsed) == len(batch):
+                    batch_prompts = parsed
+                    break
+                else:
+                    got = len(parsed) if isinstance(parsed, list) else "invalid/non-list"
+                    last_error_info = f"got {got}, expected {len(batch)}"
+                    print(f"      [attempt {attempt}/{max_attempts}: {last_error_info} -- retrying]")
+            except Exception as e:
+                last_error_info = f"error: {e}"
+                print(f"      [attempt {attempt}/{max_attempts}: {last_error_info} -- retrying]")
 
-        except Exception as e:
+        if batch_prompts is None:
             print(
-                f"\nSTOPPED: writing prompts for batch {batch_num} failed with an error: {e}\n"
-                f"This needs to be looked at rather than silently working around it.\n"
-                f"Run this exact same command again once it's fixed -- earlier batches and\n"
-                f"everything else completed so far is saved and will be reused automatically.\n"
+                f"\nSTOPPED: batch {batch_num} still failed after {max_attempts} attempts "
+                f"({last_error_info}).\n"
+                f"This needs to be looked at rather than silently guessing or padding.\n"
+                f"Run this exact same command again once it's fixed -- earlier batches\n"
+                f"and everything else completed so far is saved and will be reused.\n"
             )
             cache_path.write_text(json.dumps(all_prompts))  # save partial progress
             sys.exit(1)
+
+        all_prompts.extend(batch_prompts)
 
     cache_path.write_text(json.dumps(all_prompts))
     print(f"      Wrote {len(all_prompts)} detailed, contextual prompts")
