@@ -259,9 +259,19 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
     style guide step.
     """
     cache_path = workdir / "image_prompts.json"
+    all_prompts = []
     if cache_path.exists():
-        print(f"[0.5/6] Per-sentence image prompts already exist, skipping: {cache_path}")
-        return json.loads(cache_path.read_text())
+        existing = json.loads(cache_path.read_text())
+        if len(existing) >= len(sentences):
+            print(f"[0.5/6] Per-sentence image prompts already exist and are complete, skipping: {cache_path}")
+            return existing[:len(sentences)]
+        else:
+            print(
+                f"[0.5/6] Found a PARTIAL set of prompts ({len(existing)}/{len(sentences)}) from an "
+                f"earlier interrupted run -- resuming from sentence {len(existing)+1} instead of "
+                f"starting over."
+            )
+            all_prompts = existing
 
     print(f"[0.5/6] Writing a detailed, contextual image prompt for each of {len(sentences)} sentences...")
 
@@ -275,9 +285,8 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
         )
         sys.exit(1)
 
-    all_prompts = []
     batch_size = 10
-    for batch_start in range(0, len(sentences), batch_size):
+    for batch_start in range(len(all_prompts), len(sentences), batch_size):
         batch = sentences[batch_start:batch_start + batch_size]
         batch_num = batch_start // batch_size + 1
         total_batches = (len(sentences) + batch_size - 1) // batch_size

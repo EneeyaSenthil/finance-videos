@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
 """
-thumbnail_maker.py -- Generates 2-3 candidate YouTube thumbnails from a
-video's own generated images, with bold branded text overlay.
+thumbnail_maker.py -- Generates a purpose-built, high-CTR YouTube thumbnail,
+using the SAME LLM that already understands your whole script and style
+guide from the main pipeline -- not a random image grabbed from the video.
 
 WHY THIS APPROACH
-A high-CTR thumbnail needs: a strong, high-contrast focal image, bold
-minimal text (3-5 words), and consistent channel branding. Rather than
-generating a brand-new image blind, this reuses your video's own real
-generated images (from pipeline_tmp/beat_*.png) -- so the thumbnail
-actually represents what's in the video, not a disconnected graphic.
+A high-CTR thumbnail needs a deliberately chosen "money shot" -- the single
+most curiosity-driving visual moment in the story -- not whichever beat
+image happened to land in the middle third of the video. Since the LLM
+already read your entire script to build the style guide, it's in a much
+better position to identify that moment than a random pick.
 
-USAGE
-    python thumbnail_maker.py --workdir pipeline_tmp --text "SHOULD YOU EAT SALAD?"
+ON TEXT/TITLE CONTROL -- IMPORTANT
+The LLM SUGGESTS 3 short candidate titles. It never picks for you. You
+always choose or rewrite the final text yourself via --text.
 
-Produces 3 candidates: thumbnail_1.png, thumbnail_2.png, thumbnail_3.png
-in the current directory -- pick whichever looks strongest.
+TWO-STEP WORKFLOW
+  Step 1: get title suggestions (no image generated yet, fast)
+      python thumbnail_maker.py --get-titles --script script.txt --workdir pipeline_tmp
+
+  Step 2: once you've picked/written your title, generate the real thumbnails
+      python thumbnail_maker.py --script script.txt --workdir pipeline_tmp --text "YOUR CHOSEN TITLE"
+
+Produces 3 candidates: thumbnail_1.png, thumbnail_2.png, thumbnail_3.png --
+pick whichever looks strongest.
 """
 
 import argparse
-import random
+import json
+import os
+import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
+
+# Reuse the already-tested LLM call and image-generation chain from the main
+# pipeline instead of duplicating that logic here.
+from full_pipeline import call_llm, generate_image_for_sentence
 
 # Brand colors -- matches the channel's navy/red/white identity
 NAVY = (13, 27, 62)
@@ -46,23 +61,71 @@ BOLD_FONT = find_bold_font()
 THUMBNAIL_SIZE = (1280, 720)  # YouTube's standard thumbnail size
 
 
-def pick_source_image(workdir):
+def generate_thumbnail_concept(script_text, style_guide, workdir):
     """
-    Picks a real generated image from the video to use as the thumbnail base.
-    Prefers a middle-of-video image (often more visually interesting than
-    the opening beat) but falls back to whatever's available.
+    Asks the LLM (which already understands the whole script + style guide)
+    to identify the single most curiosity-driving visual moment for a
+    thumbnail, write a dedicated image prompt for it, and suggest 3 short
+    candidate titles. Cached to disk (resumable).
+
+    Returns (image_prompt, title_suggestions list).
     """
-    beats = sorted(Path(workdir).glob("beat_*.png"))
-    if not beats:
-        raise FileNotFoundError(
-            f"No beat_*.png images found in {workdir} -- run the main pipeline first "
-            f"so there are real generated images to build a thumbnail from."
+    cache_path = workdir / "thumbnail_concept.json"
+    if cache_path.exists():
+        data = json.loads(cache_path.read_text())
+        return data["image_prompt"], data["title_suggestions"]
+
+    print("Analyzing your script for the strongest thumbnail concept...")
+
+    hf_token = os.environ.get("HF_API_TOKEN")
+    if not hf_token:
+        print(
+            "\nSTOPPED: HF_API_TOKEN is not set, so a thumbnail concept can't be generated.\n"
+            "Set it with: export HF_API_TOKEN=\"your-token-here\"\n"
         )
-    # Prefer something from the middle third of the video
-    mid_start = len(beats) // 3
-    mid_end = max(mid_start + 1, (len(beats) * 2) // 3)
-    candidates = beats[mid_start:mid_end] or beats
-    return random.choice(candidates)
+        sys.exit(1)
+
+    prompt = (
+        "You are a YouTube thumbnail strategist for an American finance/economics "
+        "documentary channel. High-CTR thumbnails need ONE deliberately chosen, "
+        "curiosity-driving visual moment -- not a random scene.\n\n"
+        f"STYLE GUIDE for this video:\n{style_guide}\n\n"
+        f"FULL SCRIPT:\n{script_text[:3000]}\n\n"
+        "1. Identify the single most visually striking, curiosity-driving moment "
+        "in this story -- the one image that would make someone stop scrolling.\n"
+        "2. Write ONE detailed, concrete, photorealistic image-generation prompt "
+        "for that specific moment (not a person posing, not generic stock imagery -- "
+        "a real, specific scene tied directly to the story). Follow the style guide.\n"
+        "3. Suggest 3 short candidate thumbnail titles (3-6 words each, ALL CAPS, "
+        "punchy, curiosity-driven -- these are SUGGESTIONS ONLY, the creator will "
+        "choose or rewrite).\n\n"
+        "Output ONLY a JSON object with exactly this shape, nothing else:\n"
+        '{"image_prompt": "...", "title_suggestions": ["...", "...", "..."]}'
+    )
+
+    try:
+        import re
+        raw = call_llm(prompt, hf_token, max_tokens=400, temperature=0.8)
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+        data = json.loads(cleaned)
+
+        image_prompt = data["image_prompt"]
+        title_suggestions = data["title_suggestions"]
+        if not image_prompt or not isinstance(title_suggestions, list) or len(title_suggestions) == 0:
+            raise ValueError(f"unexpected response shape: {data!r}")
+
+        cache_path.write_text(json.dumps({
+            "image_prompt": image_prompt,
+            "title_suggestions": title_suggestions,
+        }))
+        return image_prompt, title_suggestions
+
+    except Exception as e:
+        print(
+            f"\nSTOPPED: thumbnail concept generation failed with an error: {e}\n"
+            f"Run this exact same command again once it's fixed.\n"
+        )
+        sys.exit(1)
 
 
 def darken_for_text(img, amount=0.45):
@@ -152,25 +215,61 @@ def make_thumbnail(source_path, text, out_path, style="bottom_banner"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate candidate YouTube thumbnails from your video's real images")
-    parser.add_argument("--workdir", default="pipeline_tmp", help="Folder containing beat_*.png images from the main pipeline")
-    parser.add_argument("--text", required=True, help="Thumbnail text, e.g. 'SHOULD YOU EAT SALAD?'")
+    parser = argparse.ArgumentParser(description="Generate a purpose-built, high-CTR YouTube thumbnail")
+    parser.add_argument("--script", required=True, help="Path to the video's script.txt")
+    parser.add_argument("--workdir", default="pipeline_tmp", help="Folder with the cached style_guide.txt from the main pipeline")
+    parser.add_argument("--text", help="Your chosen/rewritten thumbnail title. If omitted, shows suggestions and stops.")
     parser.add_argument("--out-prefix", default="thumbnail")
     args = parser.parse_args()
 
+    workdir = Path(args.workdir)
+    style_guide_path = workdir / "style_guide.txt"
+    if not style_guide_path.exists():
+        print(
+            f"Error: {style_guide_path} not found -- run full_pipeline.py on this script "
+            f"first, so a style guide exists for the thumbnail concept to build on."
+        )
+        sys.exit(1)
+
+    script_text = Path(args.script).read_text(encoding="utf-8")
+    style_guide = style_guide_path.read_text(encoding="utf-8")
+
+    image_prompt, title_suggestions = generate_thumbnail_concept(script_text, style_guide, workdir)
+
+    if not args.text:
+        print("\nThumbnail concept ready. Suggested titles (pick one, edit one, or write your own):\n")
+        for i, t in enumerate(title_suggestions, 1):
+            print(f"  {i}. {t}")
+        print(
+            f"\nRun this again with --text \"YOUR CHOSEN TITLE\" to generate the actual "
+            f"thumbnail images.\nExample:\n"
+            f"  python thumbnail_maker.py --script {args.script} --workdir {args.workdir} "
+            f"--text \"{title_suggestions[0]}\"\n"
+        )
+        return
+
+    concept_image_path = workdir / "thumbnail_concept.png"
+    if concept_image_path.exists():
+        print(f"Concept image already generated, skipping: {concept_image_path}")
+    else:
+        print("Generating the dedicated thumbnail concept image...")
+        result = generate_image_for_sentence(image_prompt, concept_image_path, THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1])
+        if result is None:
+            print(
+                "\nSTOPPED: couldn't generate the thumbnail concept image (both Pollinations "
+                "and Hugging Face failed). No placeholder was used. Run this exact same "
+                "command again in a little while.\n"
+            )
+            sys.exit(1)
+
     styles = ["bottom_banner", "top_banner", "stroke_overlay"]
-    print(f"Generating {len(styles)} thumbnail candidates from real images in {args.workdir}/...")
-
+    print(f"\nGenerating {len(styles)} text-treatment variants of your title on the concept image...")
     for i, style in enumerate(styles, 1):
-        try:
-            source = pick_source_image(args.workdir)
-            out_path = f"{args.out_prefix}_{i}.png"
-            make_thumbnail(source, args.text, out_path, style=style)
-            print(f"  {i}. {out_path}  (style: {style}, based on {source.name})")
-        except Exception as e:
-            print(f"  [{i}. {style} failed: {e}]")
+        out_path = f"{args.out_prefix}_{i}.png"
+        make_thumbnail(concept_image_path, args.text, out_path, style=style)
+        print(f"  {i}. {out_path}  (style: {style})")
 
-    print("\nDone. Open each in an image viewer/Notepad-adjacent tool and pick the strongest one.")
+    print("\nDone. Open each and pick the strongest one.")
 
 
 if __name__ == "__main__":
