@@ -221,7 +221,7 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7):
         method="POST",
     )
     payload = json.dumps({
-        "model": "meta-llama/llama-3.3-70b-instruct:free",
+        "model": "openrouter/free",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
