@@ -147,19 +147,17 @@ def generate_style_guide(script_text, workdir):
 
     print("[0/6] Generating a visual style guide from your script...")
 
-    hf_token = os.environ.get("HF_API_TOKEN")
-    if not hf_token:
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if not openrouter_key:
         print(
-            "\nSTOPPED: HF_API_TOKEN is not set, so a style guide can't be generated.\n"
-            "Set it with: export HF_API_TOKEN=\"your-token-here\"\n"
+            "\nSTOPPED: OPENROUTER_API_KEY is not set, so a style guide can't be generated.\n"
+            "Set it with: export OPENROUTER_API_KEY=\"your-key-here\"\n"
             "Then run this exact same command again -- narration, audio, and captions\n"
             "are already saved and will be reused automatically.\n"
         )
         sys.exit(1)
 
     try:
-        import urllib.request
-
         prompt = (
             "You are a visual style consultant for a YouTube documentary channel made "
             "for an American audience. Read this video script and write a SHORT visual "
@@ -176,23 +174,7 @@ def generate_style_guide(script_text, workdir):
             f"SCRIPT:\n{script_text[:2000]}"
         )
 
-        hf_url = "https://router.huggingface.co/v1/chat/completions"
-        req = urllib.request.Request(
-            hf_url,
-            headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
-            method="POST",
-        )
-        payload = json.dumps({
-            "model": "meta-llama/Llama-3.1-8B-Instruct",
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 200,
-            "temperature": 0.7,
-        })
-        req.data = payload.encode("utf-8")
-        with urllib.request.urlopen(req, timeout=60) as response:
-            result = json.loads(response.read())
-
-        generated = result["choices"][0]["message"]["content"].strip()
+        generated = call_llm(prompt, openrouter_key, max_tokens=200, temperature=0.7)
 
         if len(generated) > 20:
             print(f"      Style guide generated ({len(generated)} chars)")
@@ -223,18 +205,23 @@ def split_sentences(text):
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
-def call_llm(prompt, hf_token, max_tokens=200, temperature=0.7):
-    """Shared helper: one call to Llama 3.1 8B Instruct via Hugging Face's free router."""
+def call_llm(prompt, api_key, max_tokens=200, temperature=0.7):
+    """
+    Shared helper: one call to a free LLM via OpenRouter's free tier
+    (meta-llama/llama-3.3-70b-instruct:free) -- no payment risk as long as
+    we only ever use ":free"-tagged models. Switched from Hugging Face's
+    router after that hit real monthly credit limits (402 Payment Required).
+    """
     import urllib.request
 
-    hf_url = "https://router.huggingface.co/v1/chat/completions"
+    url = "https://openrouter.ai/api/v1/chat/completions"
     req = urllib.request.Request(
-        hf_url,
-        headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
+        url,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         method="POST",
     )
     payload = json.dumps({
-        "model": "meta-llama/Llama-3.1-8B-Instruct",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -275,11 +262,11 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
 
     print(f"[0.5/6] Writing a detailed, contextual image prompt for each of {len(sentences)} sentences...")
 
-    hf_token = os.environ.get("HF_API_TOKEN")
-    if not hf_token:
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if not openrouter_key:
         print(
-            "\nSTOPPED: HF_API_TOKEN is not set, so per-sentence prompts can't be written.\n"
-            "Set it with: export HF_API_TOKEN=\"your-token-here\"\n"
+            "\nSTOPPED: OPENROUTER_API_KEY is not set, so per-sentence prompts can't be written.\n"
+            "Set it with: export OPENROUTER_API_KEY=\"your-key-here\"\n"
             "Then run this exact same command again -- everything completed so far\n"
             "is saved and will be reused automatically.\n"
         )
@@ -326,7 +313,7 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
                     f"entries, no more, no less. Try again.\n\n" + base_prompt
                 )
             try:
-                raw = call_llm(prompt, hf_token, max_tokens=900, temperature=0.5 if attempt == 1 else 0.3)
+                raw = call_llm(prompt, openrouter_key, max_tokens=900, temperature=0.5 if attempt == 1 else 0.3)
                 cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
                 parsed = json.loads(cleaned)
 

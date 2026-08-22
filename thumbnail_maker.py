@@ -77,11 +77,11 @@ def generate_thumbnail_concept(script_text, style_guide, workdir):
 
     print("Analyzing your script for the strongest thumbnail concept...")
 
-    hf_token = os.environ.get("HF_API_TOKEN")
-    if not hf_token:
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if not openrouter_key:
         print(
-            "\nSTOPPED: HF_API_TOKEN is not set, so a thumbnail concept can't be generated.\n"
-            "Set it with: export HF_API_TOKEN=\"your-token-here\"\n"
+            "\nSTOPPED: OPENROUTER_API_KEY is not set, so a thumbnail concept can't be generated.\n"
+            "Set it with: export OPENROUTER_API_KEY=\"your-key-here\"\n"
         )
         sys.exit(1)
 
@@ -105,7 +105,7 @@ def generate_thumbnail_concept(script_text, style_guide, workdir):
 
     try:
         import re
-        raw = call_llm(prompt, hf_token, max_tokens=400, temperature=0.8)
+        raw = call_llm(prompt, openrouter_key, max_tokens=400, temperature=0.8)
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
         data = json.loads(cleaned)
 
