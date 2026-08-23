@@ -207,29 +207,54 @@ def split_sentences(text):
 
 def call_llm(prompt, api_key, max_tokens=200, temperature=0.7):
     """
-    Shared helper: one call to a free LLM via OpenRouter's free tier
-    (meta-llama/llama-3.3-70b-instruct:free) -- no payment risk as long as
-    we only ever use ":free"-tagged models. Switched from Hugging Face's
-    router after that hit real monthly credit limits (402 Payment Required).
+    Shared helper: calls a free LLM via OpenRouter, trying a short list of
+    known-stable non-reasoning free models in order (not the auto-router,
+    which can unpredictably land on a reasoning model whose actual output
+    lives in a different field than "content", leaving content empty).
+
+    Tries each candidate; moves to the next on any failure (404, empty
+    content, network error). Only raises if every candidate fails.
     """
     import urllib.request
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    payload = json.dumps({
-        "model": "openrouter/free",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    })
-    req.data = payload.encode("utf-8")
-    with urllib.request.urlopen(req, timeout=90) as response:
-        result = json.loads(response.read())
-    return result["choices"][0]["message"]["content"].strip()
+    candidates = [
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+        "openrouter/free",  # last resort: the auto-router
+    ]
+
+    last_error = None
+    for model in candidates:
+        try:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            payload = json.dumps({
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            })
+            req.data = payload.encode("utf-8")
+            with urllib.request.urlopen(req, timeout=90) as response:
+                result = json.loads(response.read())
+
+            content = result["choices"][0]["message"].get("content")
+            if content and content.strip():
+                return content.strip()
+            else:
+                last_error = f"model '{model}' returned empty/null content"
+                continue
+
+        except Exception as e:
+            last_error = f"model '{model}' failed: {e}"
+            continue
+
+    raise RuntimeError(f"All free model candidates failed. Last error: {last_error}")
 
 
 def generate_image_prompts(sentences, style_guide, script_text, workdir):
