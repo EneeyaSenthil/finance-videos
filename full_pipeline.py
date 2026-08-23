@@ -174,7 +174,7 @@ def generate_style_guide(script_text, workdir):
             f"SCRIPT:\n{script_text[:2000]}"
         )
 
-        generated = call_llm(prompt, openrouter_key, max_tokens=200, temperature=0.7)
+        generated = call_llm(prompt, openrouter_key, max_tokens=200, temperature=0.7, min_content_length=40)
 
         if len(generated) > 20:
             print(f"      Style guide generated ({len(generated)} chars)")
@@ -205,7 +205,7 @@ def split_sentences(text):
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
-def call_llm(prompt, api_key, max_tokens=200, temperature=0.7):
+def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_length=20):
     """
     Shared helper: calls a free LLM via OpenRouter, trying a short list of
     known-stable non-reasoning free models in order (not the auto-router,
@@ -213,7 +213,18 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7):
     lives in a different field than "content", leaving content empty).
 
     Tries each candidate; moves to the next on any failure (404, empty
-    content, network error). Only raises if every candidate fails.
+    content, degenerate/too-short content, network error). Only raises if
+    every candidate fails.
+
+    IMPORTANT: some free models occasionally return a bare moderation/safety
+    verdict (e.g. "User Safety: safe") instead of actually completing the
+    request. That string is technically non-empty, so checking only for
+    emptiness let it slip through as if it were a real answer. We guard
+    against that by also requiring the response to be at least
+    `min_content_length` characters -- short enough not to reject genuinely
+    brief real answers, but long enough to catch degenerate non-answers like
+    that one -- and fall through to the next candidate model when it happens,
+    instead of returning the garbage.
     """
     import urllib.request
 
@@ -244,11 +255,20 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7):
                 result = json.loads(response.read())
 
             content = result["choices"][0]["message"].get("content")
-            if content and content.strip():
-                return content.strip()
-            else:
+            content = content.strip() if content else ""
+
+            if not content:
                 last_error = f"model '{model}' returned empty/null content"
                 continue
+            if len(content) < min_content_length:
+                last_error = (
+                    f"model '{model}' returned a suspiciously short/degenerate "
+                    f"response ({len(content)} chars, likely a moderation-only "
+                    f"reply rather than a real answer): {content!r}"
+                )
+                continue
+
+            return content
 
         except Exception as e:
             last_error = f"model '{model}' failed: {e}"
