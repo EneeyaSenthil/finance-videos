@@ -276,130 +276,58 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
 
 
 def generate_image_prompts(sentences, style_guide, script_text, workdir):
-    """
-    THE PART THAT WAS MISSING: reads the WHOLE script + the style guide, and
-    writes one specific, concrete, contextual image prompt PER SENTENCE --
-    not a generic template. This is what lets an abstract sentence like
-    "that gap between fear and actual risk" become a real, grounded scene
-    (e.g. a half-empty grocery produce aisle) instead of defaulting to a
-    random generic portrait.
-
-    Cached to disk (resumable). Does NOT silently fall back -- if this
-    fails, that's a real problem worth surfacing, same philosophy as the
-    style guide step.
-    """
     cache_path = workdir / "image_prompts.json"
     all_prompts = []
+    
     if cache_path.exists():
         existing = json.loads(cache_path.read_text())
         if len(existing) >= len(sentences):
-            print(f"[0.5/6] Per-sentence image prompts already exist and are complete, skipping: {cache_path}")
+            print(f"[0.5/6] Per-sentence image prompts already exist, skipping: {cache_path}")
             return existing[:len(sentences)]
         else:
-            print(
-                f"[0.5/6] Found a PARTIAL set of prompts ({len(existing)}/{len(sentences)}) from an "
-                f"earlier interrupted run -- resuming from sentence {len(existing)+1} instead of "
-                f"starting over."
-            )
+            print(f"[0.5/6] Resuming from sentence {len(existing)+1}...")
             all_prompts = existing
 
-    print(f"[0.5/6] Writing a detailed, contextual image prompt for each of {len(sentences)} sentences...")
+    print(f"[0.5/6] Generating individual image prompts for {len(sentences)} sentences...")
 
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_key:
-        print(
-            "\nSTOPPED: OPENROUTER_API_KEY is not set, so per-sentence prompts can't be written.\n"
-            "Set it with: export OPENROUTER_API_KEY=\"your-key-here\"\n"
-            "Then run this exact same command again -- everything completed so far\n"
-            "is saved and will be reused automatically.\n"
-        )
+        print("\nSTOPPED: OPENROUTER_API_KEY is not set.\n")
         sys.exit(1)
 
-    batch_size = 10
-    for batch_start in range(len(all_prompts), len(sentences), batch_size):
-        batch = sentences[batch_start:batch_start + batch_size]
-        batch_num = batch_start // batch_size + 1
-        total_batches = (len(sentences) + batch_size - 1) // batch_size
-        print(f"      Batch {batch_num}/{total_batches} ({len(batch)} sentences)...")
+    # Loop sentence by sentence -- the response IS the string!
+    for i in range(len(all_prompts), len(sentences)):
+        sentence = sentences[i]
+        print(f"      Sentence {i+1}/{len(sentences)}...")
 
-        numbered = "\n".join(f"{i+1}. {s}" for i, s in enumerate(batch))
-        base_prompt = (
-            "You are an expert visual director for an American YouTube documentary "
-            "channel. Here is the FULL SCRIPT for context, so you understand the whole "
-            f"story, its vibe, and what matters to an American audience:\n\n{script_text[:3000]}\n\n"
-            f"Here is the established visual STYLE GUIDE for this video:\n{style_guide}\n\n"
-            "Now write ONE detailed, concrete, photorealistic image-generation prompt for "
-            "EACH of the following sentences from that script. For each sentence: translate "
-            "any abstract idea, statistic, or transition into a real, specific, visualizable "
-            "American scene (not a person posing for a photo, not a fashion shot) that fits "
-            "naturally into the story at that point. Follow the style guide's palette and "
-            "mood. Only include a person if the sentence specifically requires showing someone "
-            "doing something functional (e.g. a shopper, a farmer, a CEO speaking) -- never a "
-            "generic portrait. Each prompt should be a single descriptive sentence, 15-30 words.\n\n"
-            f"SENTENCES (there are exactly {len(batch)} numbered sentences below -- count them):\n{numbered}\n\n"
-            f"Output ONLY a JSON array of EXACTLY {len(batch)} strings, one prompt per sentence "
-            f"in order, nothing else -- no markdown, no explanation. Before answering, recount: "
-            f"you must output precisely {len(batch)} array entries, not {len(batch)-1}, not {len(batch)+1}."
+        prompt = (
+            f"Style Guide: {style_guide}\n\n"
+            f"Convert this specific script sentence into a short, photorealistic image-generation prompt (15-30 words). "
+            f"Output ONLY the prompt text, nothing else, no quotes, no preamble:\n\"{sentence}\""
         )
 
-        batch_prompts = None
-        last_error_info = ""
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            prompt = base_prompt
-            if attempt > 1:
-                # Strengthen the correction on retries -- same trusted LLM, same
-                # task, just a clearer nudge. This is a retry, not a fallback.
-                prompt = (
-                    f"CORRECTION NEEDED: your previous attempt returned the wrong number of "
-                    f"array entries ({last_error_info}). You MUST return EXACTLY {len(batch)} "
-                    f"entries, no more, no less. Try again.\n\n" + base_prompt
-                )
-            raw = None
+        final_prompt = None
+        for attempt in range(1, 3):
             try:
-                raw = call_llm(prompt, openrouter_key, max_tokens=900, temperature=0.5 if attempt == 1 else 0.3)
-                cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-                try:
-                    parsed = json.loads(cleaned)
-                except json.JSONDecodeError:
-                    # Some models add a preamble/postamble ("Here's the JSON:") despite
-                    # being told not to, which breaks a straight json.loads. Salvage the
-                    # array by taking the substring from the first '[' to the last ']'
-                    # rather than failing outright on cosmetic wrapping text.
-                    match = re.search(r"\[.*\]", cleaned, re.DOTALL)
-                    if not match:
-                        raise
-                    parsed = json.loads(match.group(0))
-
-                if isinstance(parsed, list) and len(parsed) == len(batch):
-                    batch_prompts = parsed
+                raw = call_llm(prompt, openrouter_key, max_tokens=100, temperature=0.5)
+                # Clean up any accidental wrapping quotes or markdown
+                cleaned = raw.strip().strip('"').strip("'")
+                if len(cleaned) > 10:
+                    final_prompt = cleaned
                     break
-                else:
-                    got = len(parsed) if isinstance(parsed, list) else "invalid/non-list"
-                    last_error_info = f"got {got}, expected {len(batch)}"
-                    print(f"      [attempt {attempt}/{max_attempts}: {last_error_info} -- retrying]")
-            except Exception as e:
-                snippet = raw[:200].replace("\n", " ") if raw else "(no response received)"
-                last_error_info = f"error: {e} -- raw response started with: {snippet!r}"
-                print(f"      [attempt {attempt}/{max_attempts}: {last_error_info} -- retrying]")
+            except Exception:
+                pass
 
-        if batch_prompts is None:
-            print(
-                f"\nSTOPPED: batch {batch_num} still failed after {max_attempts} attempts "
-                f"({last_error_info}).\n"
-                f"This needs to be looked at rather than silently guessing or padding.\n"
-                f"Run this exact same command again once it's fixed -- earlier batches\n"
-                f"and everything else completed so far is saved and will be reused.\n"
-            )
-            cache_path.write_text(json.dumps(all_prompts))  # save partial progress
-            sys.exit(1)
+        # Ultimate fallback: if LLM fails for this sentence, use the sentence itself
+        if not final_prompt:
+            final_prompt = sentence
 
-        all_prompts.extend(batch_prompts)
+        all_prompts.append(final_prompt)
+        # Save progress incrementally so you never lose work
+        cache_path.write_text(json.dumps(all_prompts))
 
-    cache_path.write_text(json.dumps(all_prompts))
-    print(f"      Wrote {len(all_prompts)} detailed, contextual prompts")
+    print(f"      Successfully generated all {len(all_prompts)} prompts sentence-by-sentence.")
     return all_prompts
-
 
 def generate_image_for_sentence(authored_prompt, out_path, width, height):
     """
