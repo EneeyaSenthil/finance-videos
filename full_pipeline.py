@@ -229,12 +229,10 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
     import urllib.request
 
     candidates = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "qwen/qwen-2.5-72b-instruct:free",
-        "openrouter/free",  # last resort: the auto-router
+        "openai/gpt-oss-20b:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "openai/gpt-oss-120b:free",
     ]
-
     last_error = None
     for model in candidates:
         try:
