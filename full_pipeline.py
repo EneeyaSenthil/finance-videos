@@ -357,10 +357,21 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
                     f"array entries ({last_error_info}). You MUST return EXACTLY {len(batch)} "
                     f"entries, no more, no less. Try again.\n\n" + base_prompt
                 )
+            raw = None
             try:
                 raw = call_llm(prompt, openrouter_key, max_tokens=900, temperature=0.5 if attempt == 1 else 0.3)
                 cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-                parsed = json.loads(cleaned)
+                try:
+                    parsed = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    # Some models add a preamble/postamble ("Here's the JSON:") despite
+                    # being told not to, which breaks a straight json.loads. Salvage the
+                    # array by taking the substring from the first '[' to the last ']'
+                    # rather than failing outright on cosmetic wrapping text.
+                    match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+                    if not match:
+                        raise
+                    parsed = json.loads(match.group(0))
 
                 if isinstance(parsed, list) and len(parsed) == len(batch):
                     batch_prompts = parsed
@@ -370,7 +381,8 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
                     last_error_info = f"got {got}, expected {len(batch)}"
                     print(f"      [attempt {attempt}/{max_attempts}: {last_error_info} -- retrying]")
             except Exception as e:
-                last_error_info = f"error: {e}"
+                snippet = raw[:200].replace("\n", " ") if raw else "(no response received)"
+                last_error_info = f"error: {e} -- raw response started with: {snippet!r}"
                 print(f"      [attempt {attempt}/{max_attempts}: {last_error_info} -- retrying]")
 
         if batch_prompts is None:
