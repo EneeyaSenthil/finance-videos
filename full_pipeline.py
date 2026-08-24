@@ -130,11 +130,95 @@ def get_word_timings(audio_path):
 # ---------------------------------------------------------------------------
 # STEP 5: One image per sentence (free, no key) + Ken Burns motion
 # ---------------------------------------------------------------------------
+def chunk_script(script_text, max_chars=4000):
+    """
+    Splits the script into sentence-boundary-safe chunks of roughly max_chars
+    each, so a script of ANY length (5,000 / 10,000 / 20,000+ characters) can
+    be read in full without truncation. Each chunk is a clean run of whole
+    sentences -- never a mid-sentence cut.
+    """
+    sentences = split_sentences(script_text)
+    chunks = []
+    current, current_len = [], 0
+    for s in sentences:
+        if current and current_len + len(s) + 1 > max_chars:
+            chunks.append(" ".join(current))
+            current, current_len = [], 0
+        current.append(s)
+        current_len += len(s) + 1
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def summarize_script_chunk(chunk_text, chunk_index, total_chunks, api_key):
+    """
+    One piece of the map-reduce read: extract plain notes from a single slice
+    of the script -- concrete subject matter, named entities/numbers, tone,
+    and any strong visual imagery implied by the words. No topic-specific
+    wording baked in here; this must work for ANY script, on any subject.
+    """
+    prompt = (
+        f"This is part {chunk_index + 1} of {total_chunks} of a longer video script "
+        "for a YouTube channel. Read this part carefully and write plain notes (under "
+        "80 words) covering: the specific subject matter discussed in this part, any "
+        "concrete people/places/companies/numbers/events named, the emotional tone, and "
+        "any strong visual imagery implied by the words. Output ONLY the notes, no "
+        "preamble, no restating these instructions.\n\n"
+        f"SCRIPT PART:\n{chunk_text}"
+    )
+    return call_llm(prompt, api_key, max_tokens=150, temperature=0.4, min_content_length=15)
+
+
+def read_full_script(script_text, workdir, api_key):
+    """
+    Reads the ENTIRE script, regardless of length, via a resumable map-reduce
+    pass: slice into chunks -> summarize each chunk -> return the combined
+    notes covering the full runtime of the video, not just the opening.
+    """
+    notes_cache = workdir / "script_notes.json"
+    chunks = chunk_script(script_text, max_chars=4000)
+
+    if len(chunks) == 1:
+        # Short script: no need to summarize, the whole thing fits in one call.
+        return script_text
+
+    notes = []
+    if notes_cache.exists():
+        notes = json.loads(notes_cache.read_text())
+
+    if len(notes) >= len(chunks):
+        print(f"      Full-script read already done ({len(chunks)} parts), reusing.")
+        return "\n".join(f"Part {i + 1}: {n}" for i, n in enumerate(notes[:len(chunks)]))
+
+    print(f"      Script is long -- reading it in {len(chunks)} parts so nothing gets skipped...")
+    for i in range(len(notes), len(chunks)):
+        print(f"      Reading part {i + 1}/{len(chunks)}...")
+        try:
+            note = summarize_script_chunk(chunks[i], i, len(chunks), api_key)
+        except Exception as e:
+            print(f"\nSTOPPED: reading part {i + 1}/{len(chunks)} of the script failed: {e}\n"
+                  f"Run this exact same command again -- parts already read are saved.\n")
+            sys.exit(1)
+        notes.append(note)
+        notes_cache.write_text(json.dumps(notes))
+
+    return "\n".join(f"Part {i + 1}: {n}" for i, n in enumerate(notes))
+
+
 def generate_style_guide(script_text, workdir):
     """
-    Reads the WHOLE script once and generates a short visual style brief --
-    color palette, mood, tone, recurring motifs -- so every sentence's image
-    shares one coherent identity instead of being generated in isolation.
+    Reads the WHOLE script -- no matter how long -- and generates a visual
+    style brief that acts as the PARENT for every sentence's image prompt:
+    the concrete topic, the mood, a specific color palette tailored to an
+    American audience, and what real American settings fit the story. Every
+    sentence prompt later inherits from this, the same way a child class
+    inherits from a parent class, so every image in the video feels like it
+    belongs to the same piece rather than being generated in isolation.
+
+    This function is fully generic -- it contains no hardcoded topic,
+    channel, or subject matter. It works the same way whether the script is
+    about food safety, interest rates, or anything else.
 
     Cached to disk (resumable like every other stage). Does NOT silently
     fall back to a generic default -- if generation fails, that's a real
@@ -145,7 +229,7 @@ def generate_style_guide(script_text, workdir):
         print(f"[0/6] Style guide already exists, skipping: {cache_path}")
         return cache_path.read_text(encoding="utf-8")
 
-    print("[0/6] Generating a visual style guide from your script...")
+    print("[0/6] Reading the full script and generating a visual style guide...")
 
     openrouter_key = os.environ.get("OPENROUTER_API_KEY")
     if not openrouter_key:
@@ -158,23 +242,33 @@ def generate_style_guide(script_text, workdir):
         sys.exit(1)
 
     try:
+        script_understanding = read_full_script(script_text, workdir, openrouter_key)
+
         prompt = (
             "You are a visual style consultant for a YouTube documentary channel made "
-            "for an American audience. Read this video script and write a SHORT visual "
-            "brief (under 120 words). Start with a single line: 'TOPIC: ' followed by "
-            "3-6 words naming the concrete subject matter of this video (e.g. 'lettuce "
-            "contamination outbreak, grocery stores, stock market'). Then cover: a specific "
-            "color palette (2-3 colors), the overall mood/tone, and what kind of real, "
-            "everyday American settings would fit this story (not abstract or generic). "
-            "The style must read as authentically American and photorealistic -- explicitly "
-            "avoid anything that looks like typical AI-generated art (no glossy/uncanny "
-            "lighting, no surreal composition, no digital illustration look, no fashion "
-            "photography, no character portraits of models unless a specific real person is "
-            "named in the script). Output ONLY the brief, no preamble.\n\n"
-            f"SCRIPT:\n{script_text[:2000]}"
+            "for an American audience. Below is either the full script, or notes "
+            "covering the full script part-by-part (if it was long). Read all of it -- "
+            "it spans the entire video, not just the beginning -- and understand the "
+            "concept, the topic, and the mood it is aiming to deliver. Then write a "
+            "visual style brief (under 200 words) that will act as the BASE STYLE every "
+            "single shot in this video must inherit from. Structure it exactly like this:\n\n"
+            "TOPIC: (3-8 words naming the concrete subject matter of this whole video)\n"
+            "MOOD: (the overall emotional tone/mood of the video)\n"
+            "COLOR PALETTE: (2-3 specific colors that fit this topic and an American "
+            "visual-storytelling sensibility)\n"
+            "SETTINGS: (the kind of real, everyday American locations/settings that fit "
+            "this story -- specific, not abstract or generic)\n"
+            "STYLE RULES: (how every shot should look and feel, and what to explicitly "
+            "avoid -- it must read as authentically American and photorealistic, never "
+            "like typical AI-generated art: no glossy/uncanny lighting, no surreal "
+            "composition, no digital illustration look, no fashion photography, no "
+            "character portraits of models unless a specific real person is named in the "
+            "script)\n\n"
+            "Output ONLY the brief in that structure, no preamble.\n\n"
+            f"SCRIPT / SCRIPT NOTES:\n{script_understanding}"
         )
 
-        generated = call_llm(prompt, openrouter_key, max_tokens=200, temperature=0.7, min_content_length=40)
+        generated = call_llm(prompt, openrouter_key, max_tokens=350, temperature=0.7, min_content_length=60)
 
         if len(generated) > 20:
             print(f"      Style guide generated ({len(generated)} chars)")
@@ -190,6 +284,8 @@ def generate_style_guide(script_text, workdir):
             )
             sys.exit(1)
 
+    except SystemExit:
+        raise
     except Exception as e:
         print(
             f"\nSTOPPED: style guide generation failed with an error: {e}\n"
@@ -298,18 +394,53 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
     # Loop sentence by sentence -- the response IS the string!
     for i in range(len(all_prompts), len(sentences)):
         sentence = sentences[i]
+        prev_sentence = sentences[i - 1] if i > 0 else None
+        next_sentence = sentences[i + 1] if i < len(sentences) - 1 else None
         print(f"      Sentence {i+1}/{len(sentences)}...")
 
+        context_lines = []
+        if prev_sentence:
+            context_lines.append(f"PREVIOUS SENTENCE (for context only, do not depict this one): {prev_sentence}")
+        context_lines.append(f"CURRENT SENTENCE (this is the one to depict): {sentence}")
+        if next_sentence:
+            context_lines.append(f"NEXT SENTENCE (for context only, do not depict this one): {next_sentence}")
+        local_context = "\n".join(context_lines)
+
+        # The style guide is the PARENT every sentence prompt must inherit from --
+        # same topic, mood, color palette, settings, and style rules on every shot,
+        # so the sentence prompt below only has to decide the SPECIFIC shot.
         prompt = (
-            f"Style Guide: {style_guide}\n\n"
-            f"Convert this specific script sentence into a short, photorealistic image-generation prompt (15-30 words). "
-            f"Output ONLY the prompt text, nothing else, no quotes, no preamble:\n\"{sentence}\""
+            "You are a cinematographer writing a single detailed shot description for a "
+            "photorealistic documentary-style video. This must work for any script on any "
+            "topic -- do not assume a specific subject beyond what is given below.\n\n"
+            f"STYLE GUIDE (the base every shot must inherit from -- topic, mood, color "
+            f"palette, settings, and style rules):\n{style_guide}\n\n"
+            f"SCRIPT CONTEXT (so this shot flows naturally from what came before and into "
+            f"what comes next):\n{local_context}\n\n"
+            "First, understand what the CURRENT SENTENCE is actually trying to convey "
+            "visually -- the real-world action, object, place, or idea behind the words, "
+            "not just the literal nouns. Then write ONE detailed, specific image-generation "
+            "prompt for that single shot. It must:\n"
+            "- Follow the style guide's palette, mood, and settings exactly (inherit, don't "
+            "contradict it)\n"
+            "- Specify a camera angle and shot type (e.g. low angle, eye-level, over-the-"
+            "shoulder, close-up, wide establishing shot, macro detail shot)\n"
+            "- Specify camera/lens settings that fit the shot (e.g. 35mm lens, shallow depth "
+            "of field, natural window light, handheld, tripod-locked)\n"
+            "- Depict a real, everyday American setting and be visually relatable to an "
+            "American audience\n"
+            "- Directly and specifically visualize what this sentence is saying -- not a "
+            "vague or generic scene\n"
+            "- Read as real photojournalism, never as AI-generated art (no glossy/uncanny "
+            "lighting, no surreal composition, no illustration look)\n\n"
+            "Output ONLY the finished prompt itself, nothing else -- no quotes, no labels, "
+            "no preamble, no explanation of your choices."
         )
 
         final_prompt = None
         for attempt in range(1, 3):
             try:
-                raw = call_llm(prompt, openrouter_key, max_tokens=100, temperature=0.5)
+                raw = call_llm(prompt, openrouter_key, max_tokens=180, temperature=0.6, min_content_length=25)
                 # Clean up any accidental wrapping quotes or markdown
                 cleaned = raw.strip().strip('"').strip("'")
                 if len(cleaned) > 10:
