@@ -343,7 +343,7 @@ def _get_gemini_text_candidates(api_key):
 
     import urllib.request
 
-    fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    fallback = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
@@ -368,7 +368,15 @@ def _get_gemini_text_candidates(api_key):
         if text_ids:
             # Prefer plain "flash" over "flash-lite"/"flash-8b" variants by
             # sorting shorter names first (usually the more capable default).
-            text_ids.sort(key=len)
+            # Prefer newer 3.x Flash models over 2.x -- Google has started
+            # telling new users 2.5-flash is deprecated in favor of 3.x, and
+            # among same-generation options a shorter plain "flash" name
+            # (vs "flash-lite") is usually the more capable default.
+            def _version_rank(name):
+                m = re.search(r"gemini-(\d+)", name)
+                major = int(m.group(1)) if m else 0
+                return (-major, len(name))
+            text_ids.sort(key=_version_rank)
             _GEMINI_TEXT_MODEL_CACHE = text_ids[:5]
             print(f"      (using {len(_GEMINI_TEXT_MODEL_CACHE)} Gemini text models currently live for this key: {_GEMINI_TEXT_MODEL_CACHE})")
             return _GEMINI_TEXT_MODEL_CACHE
