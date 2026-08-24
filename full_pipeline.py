@@ -301,6 +301,62 @@ def split_sentences(text):
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
+_FREE_MODEL_CACHE = None  # fetched once per run, reused by every call_llm() call
+
+
+def _get_free_model_candidates(api_key):
+    """
+    Asks OpenRouter for its CURRENT list of $0 models and returns a handful
+    of candidates to try, largest/most-capable first. Cached in-memory so
+    this only hits the network once per run of the pipeline, not once per
+    sentence.
+
+    Falls back to a hardcoded list (current as of writing) only if the live
+    lookup itself fails -- e.g. a brief network hiccup to openrouter.ai.
+    """
+    global _FREE_MODEL_CACHE
+    if _FREE_MODEL_CACHE is not None:
+        return _FREE_MODEL_CACHE
+
+    import urllib.request
+
+    fallback = [
+        "nvidia/nemotron-nano-9b-v2:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "cohere/north-mini-code:free",
+        "z-ai/glm-5.2:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+    ]
+
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            data = json.loads(response.read())
+
+        free_ids = []
+        for m in data.get("data", []):
+            model_id = m.get("id", "")
+            pricing = m.get("pricing", {})
+            if model_id.endswith(":free") and pricing.get("prompt") in ("0", 0):
+                free_ids.append(model_id)
+
+        if free_ids:
+            # A handful is enough -- we just need options to fall through to
+            # if one is rate-limited or misbehaves for this particular call.
+            _FREE_MODEL_CACHE = free_ids[:6]
+            print(f"      (using {len(_FREE_MODEL_CACHE)} free models currently live on OpenRouter)")
+            return _FREE_MODEL_CACHE
+
+    except Exception as e:
+        print(f"      (couldn't fetch the live free-model list from OpenRouter: {e} -- using a fallback list)")
+
+    _FREE_MODEL_CACHE = fallback
+    return _FREE_MODEL_CACHE
+
+
 def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_length=20):
     """
     Shared helper: calls a free LLM via OpenRouter, trying a short list of
@@ -324,20 +380,21 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
     """
     import urllib.request
 
-    # Plain instruct models FIRST -- these answer directly, no internal
-    # "thinking out loud" step. The gpt-oss / nemotron models are REASONING
-    # models: they think step-by-step before answering, and on the free tier
-    # that internal reasoning can consume the whole max_tokens budget and/or
-    # leak into the "content" field as raw scratchpad text (e.g. "We need to
-    # output..."). They're kept as a last-resort fallback only, with
-    # reasoning explicitly excluded below.
-    candidates = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "mistralai/mistral-small-3.1-24b-instruct:free",
-        "openai/gpt-oss-20b:free",
-        "nvidia/nemotron-3-nano-30b-a3b:free",
-        "openai/gpt-oss-120b:free",
-    ]
+    # The free-model roster on OpenRouter rotates constantly -- models that
+    # worked last month can 404 today. So instead of trusting a hardcoded
+    # list of names, ask OpenRouter what's free RIGHT NOW and use that. Only
+    # falls back to a hardcoded list if that lookup itself fails (e.g. no
+    # network to openrouter.ai for a moment).
+    candidates = _get_free_model_candidates(api_key)
+
+    # Almost every current free model is a REASONING model: it thinks
+    # step-by-step internally before answering. Two defenses against that
+    # leaking into our output: (1) tell OpenRouter to strip reasoning tokens
+    # from the response entirely, and (2) for NVIDIA Nemotron models
+    # specifically, their own docs say a system message can turn extended
+    # thinking off outright. Both are harmless no-ops on models that don't
+    # support them.
+    system_msg = {"role": "system", "content": "detailed thinking off"}
 
     # Phrases that only show up when a reasoning model's internal scratchpad
     # leaks into the answer instead of the finished response. If content
@@ -347,6 +404,12 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
         "we need to output", "we need to produce", "let's craft", "let's think",
         "the user wants", "the user gave", "output only the notes",
     )
+
+    # Reasoning models spend part of max_tokens on hidden thinking even when
+    # "exclude" is set, so give real headroom -- otherwise the final answer
+    # gets cut off before it's ever written, same failure as before just
+    # hidden instead of visible.
+    effective_max_tokens = max(max_tokens * 4, 600)
 
     last_error = None
     for model in candidates:
@@ -359,8 +422,8 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
             )
             payload = json.dumps({
                 "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
+                "messages": [system_msg, {"role": "user", "content": prompt}],
+                "max_tokens": effective_max_tokens,
                 "temperature": temperature,
                 # If this model has a reasoning mode, strip its reasoning
                 # tokens from the response entirely -- only the final answer
