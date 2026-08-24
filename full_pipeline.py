@@ -408,23 +408,36 @@ def _thinking_config_for_model(model_name):
     return None
 
 
+_GEMINI_TEXT_ROTATION_INDEX = 0  # spreads calls across models instead of exhausting one
+
+
 def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_length=20):
     """
     Shared helper: calls Gemini (Google AI Studio / Gemini Developer API) for
-    text generation, trying free-tier Flash models in order.
+    text generation, trying free-tier Flash models.
 
-    On a 429 (rate limit / quota), retries the SAME model with backoff a few
-    times first -- RPM limits are per-model and per-minute, so a short wait
-    usually clears it -- before giving up on that model and trying the next
-    one. On any other failure (model unavailable, empty/degenerate content),
-    moves straight to the next candidate. Only raises if every candidate
-    fails.
+    Free-tier daily/per-minute quotas on some models (especially newer
+    preview ones) can be very small -- as low as ~20 requests. Two things
+    follow from that:
+      1. Retrying a 429 on the SAME model wastes time and doesn't help --
+         each retry is itself another request against that same exhausted
+         quota, digging the hole deeper instead of recovering. So a 429
+         moves straight to the next model, no backoff loop.
+      2. Calls round-robin across all available candidate models (starting
+         from a different model each time this is called) instead of always
+         hammering candidates[0] first -- this spreads 88 sentences' worth
+         of calls across 5 models instead of exhausting the first one alone.
+    Only raises if every candidate fails.
     """
+    global _GEMINI_TEXT_ROTATION_INDEX
     import time
     import urllib.error
     import urllib.request
 
-    candidates = _get_gemini_text_candidates(api_key)
+    all_candidates = _get_gemini_text_candidates(api_key)
+    idx = _GEMINI_TEXT_ROTATION_INDEX % len(all_candidates)
+    candidates = all_candidates[idx:] + all_candidates[:idx]
+    _GEMINI_TEXT_ROTATION_INDEX += 1
 
     all_errors = []
     saw_bad_key = False
@@ -435,77 +448,73 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
         # the actual response isn't the part that gets cut off.
         effective_max_tokens = max_tokens * 6 if thinking_config else max_tokens
 
-        for attempt in range(3):  # up to 3 tries per model, only for 429s
-            try:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={api_key}"
-                )
-                req = urllib.request.Request(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                generation_config = {
-                    "maxOutputTokens": effective_max_tokens,
-                    "temperature": temperature,
-                }
-                if thinking_config:
-                    generation_config["thinkingConfig"] = thinking_config
-                payload = json.dumps({
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": generation_config,
-                })
-                req.data = payload.encode("utf-8")
-                with urllib.request.urlopen(req, timeout=90) as response:
-                    result = json.loads(response.read())
+        try:
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
+            req = urllib.request.Request(
+                url,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            generation_config = {
+                "maxOutputTokens": effective_max_tokens,
+                "temperature": temperature,
+            }
+            if thinking_config:
+                generation_config["thinkingConfig"] = thinking_config
+            payload = json.dumps({
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": generation_config,
+            })
+            req.data = payload.encode("utf-8")
+            with urllib.request.urlopen(req, timeout=90) as response:
+                result = json.loads(response.read())
 
-                candidates_out = result.get("candidates", [])
-                content = ""
-                if candidates_out:
-                    parts = candidates_out[0].get("content", {}).get("parts", [])
-                    content = "".join(p.get("text", "") for p in parts).strip()
+            candidates_out = result.get("candidates", [])
+            content = ""
+            if candidates_out:
+                parts = candidates_out[0].get("content", {}).get("parts", [])
+                content = "".join(p.get("text", "") for p in parts).strip()
 
-                if not content:
-                    finish_reason = candidates_out[0].get("finishReason") if candidates_out else "NO_CANDIDATES"
-                    msg = f"model '{model}' returned empty content (finishReason: {finish_reason})"
-                    print(f"      [{msg} -- trying next]")
-                    all_errors.append(msg)
-                    break  # not a rate limit -- no point retrying this model
-                if len(content) < min_content_length:
-                    msg = (
-                        f"model '{model}' returned a suspiciously short/degenerate "
-                        f"response ({len(content)} chars): {content!r}"
-                    )
-                    print(f"      [{msg} -- trying next]")
-                    all_errors.append(msg)
-                    break
-
-                # Small pacing delay after every successful call, to stay
-                # comfortably under the free tier's requests-per-minute cap
-                # instead of only reacting to 429s after they happen.
-                time.sleep(2)
-                return content
-
-            except urllib.error.HTTPError as e:
-                described = _describe_google_error(e)
-                if e.code == 429 and attempt < 2:
-                    wait = 20 * (attempt + 1)
-                    print(f"      [model '{model}' rate-limited (429) -- waiting {wait}s and retrying same model...]")
-                    time.sleep(wait)
-                    continue
-                msg = f"model '{model}' failed: {described}"
+            if not content:
+                finish_reason = candidates_out[0].get("finishReason") if candidates_out else "NO_CANDIDATES"
+                msg = f"model '{model}' returned empty content (finishReason: {finish_reason})"
                 print(f"      [{msg} -- trying next]")
                 all_errors.append(msg)
-                if e.code == 400 and "api key" in described.lower():
-                    saw_bad_key = True
-                break
-
-            except Exception as e:
-                msg = f"model '{model}' failed: {e}"
+                continue
+            if len(content) < min_content_length:
+                msg = (
+                    f"model '{model}' returned a suspiciously short/degenerate "
+                    f"response ({len(content)} chars): {content!r}"
+                )
                 print(f"      [{msg} -- trying next]")
                 all_errors.append(msg)
-                break
+                continue
+
+            # Small pacing delay after every successful call, to stay
+            # comfortably under the free tier's requests-per-minute cap
+            # instead of only reacting to 429s after they happen.
+            time.sleep(2)
+            return content
+
+        except urllib.error.HTTPError as e:
+            described = _describe_google_error(e)
+            if e.code == 429:
+                print(f"      [model '{model}' rate-limited/quota-exhausted (429) -- moving to next model]")
+            else:
+                print(f"      [model '{model}' failed: {described} -- trying next]")
+            all_errors.append(f"model '{model}' failed: {described}")
+            if e.code == 400 and "api key" in described.lower():
+                saw_bad_key = True
+            continue
+
+        except Exception as e:
+            msg = f"model '{model}' failed: {e}"
+            print(f"      [{msg} -- trying next]")
+            all_errors.append(msg)
+            continue
 
     if saw_bad_key:
         print(
