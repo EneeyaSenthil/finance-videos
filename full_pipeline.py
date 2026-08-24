@@ -343,7 +343,7 @@ def _get_gemini_text_candidates(api_key):
 
     import urllib.request
 
-    fallback = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
