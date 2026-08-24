@@ -271,7 +271,7 @@ def generate_style_guide(script_text, workdir):
             f"SCRIPT / SCRIPT NOTES:\n{script_understanding}"
         )
 
-        generated = call_llm(prompt, gemini_key, max_tokens=350, temperature=0.7, min_content_length=60)
+        generated = call_llm(prompt, gemini_key, max_tokens=350, temperature=0.7, min_content_length=300)
 
         if len(generated) > 20:
             print(f"      Style guide generated ({len(generated)} chars)")
@@ -343,7 +343,7 @@ def _get_gemini_text_candidates(api_key):
 
     import urllib.request
 
-    fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    fallback = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
@@ -388,6 +388,26 @@ def _get_gemini_text_candidates(api_key):
     return _GEMINI_TEXT_MODEL_CACHE
 
 
+def _thinking_config_for_model(model_name):
+    """
+    Gemini 3.x and 2.5 models "think" before answering by default, and those
+    hidden thinking tokens are deducted from maxOutputTokens -- exactly the
+    bug that truncated responses down to a few words. Turn it down as much
+    as each model generation actually allows:
+      - Gemini 3.x: thinking CANNOT be fully disabled (per Google's own
+        docs), so use the lowest level ("low") to minimize the burn.
+      - Gemini 2.5: thinking CAN be fully disabled via thinkingBudget=0.
+      - Gemini 2.0 and earlier: no thinking config exists, so return None.
+    thinkingLevel and thinkingBudget must never both be set (that's a 400).
+    """
+    lname = model_name.lower()
+    if lname.startswith("gemini-3"):
+        return {"thinkingLevel": "low"}
+    if lname.startswith("gemini-2.5"):
+        return {"thinkingBudget": 0}
+    return None
+
+
 def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_length=20):
     """
     Shared helper: calls Gemini (Google AI Studio / Gemini Developer API) for
@@ -409,6 +429,12 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
     all_errors = []
     saw_bad_key = False
     for model in candidates:
+        thinking_config = _thinking_config_for_model(model)
+        # Even at the lowest thinking level, some tokens still go to hidden
+        # thinking before the real answer starts -- give real headroom so
+        # the actual response isn't the part that gets cut off.
+        effective_max_tokens = max_tokens * 6 if thinking_config else max_tokens
+
         for attempt in range(3):  # up to 3 tries per model, only for 429s
             try:
                 url = (
@@ -420,12 +446,15 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
+                generation_config = {
+                    "maxOutputTokens": effective_max_tokens,
+                    "temperature": temperature,
+                }
+                if thinking_config:
+                    generation_config["thinkingConfig"] = thinking_config
                 payload = json.dumps({
                     "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        "maxOutputTokens": max_tokens,
-                        "temperature": temperature,
-                    },
+                    "generationConfig": generation_config,
                 })
                 req.data = payload.encode("utf-8")
                 with urllib.request.urlopen(req, timeout=90) as response:
@@ -558,7 +587,7 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
         final_prompt = None
         for attempt in range(1, 3):
             try:
-                raw = call_llm(prompt, gemini_key, max_tokens=180, temperature=0.6, min_content_length=25)
+                raw = call_llm(prompt, gemini_key, max_tokens=180, temperature=0.6, min_content_length=60)
                 # Clean up any accidental wrapping quotes or markdown
                 cleaned = raw.strip().strip('"').strip("'")
                 if len(cleaned) > 10:
