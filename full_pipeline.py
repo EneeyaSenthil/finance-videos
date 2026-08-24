@@ -304,6 +304,26 @@ def split_sentences(text):
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
+def _describe_google_error(e):
+    """
+    urllib only gives us 'HTTP Error 400: Bad Request' by default, which
+    hides the actually useful part. Google's error responses are JSON with a
+    real explanation (e.g. "API key not valid", "User location is not
+    supported", quota details) -- read the body and surface that instead.
+    """
+    import urllib.error
+
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body)
+            message = parsed.get("error", {}).get("message", body)
+            return f"HTTP {e.code}: {message}"
+        except Exception:
+            return f"HTTP {e.code}: {e.reason}"
+    return str(e)
+
+
 _GEMINI_TEXT_MODEL_CACHE = None  # fetched once per run, reused by every call_llm() call
 
 
@@ -314,8 +334,8 @@ def _get_gemini_text_candidates(api_key):
     fastest/cheapest first. Cached in-memory so this only hits the network
     once per run of the pipeline, not once per sentence.
 
-    Falls back to a hardcoded list (current as of writing) only if the live
-    lookup itself fails.
+    Falls back to a hardcoded list (current as of writing, per Google's live
+    rate-limits page) only if the live lookup itself fails.
     """
     global _GEMINI_TEXT_MODEL_CACHE
     if _GEMINI_TEXT_MODEL_CACHE is not None:
@@ -323,7 +343,7 @@ def _get_gemini_text_candidates(api_key):
 
     import urllib.request
 
-    fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-lite"]
+    fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
@@ -350,11 +370,11 @@ def _get_gemini_text_candidates(api_key):
             # sorting shorter names first (usually the more capable default).
             text_ids.sort(key=len)
             _GEMINI_TEXT_MODEL_CACHE = text_ids[:5]
-            print(f"      (using {len(_GEMINI_TEXT_MODEL_CACHE)} Gemini text models currently live for this key)")
+            print(f"      (using {len(_GEMINI_TEXT_MODEL_CACHE)} Gemini text models currently live for this key: {_GEMINI_TEXT_MODEL_CACHE})")
             return _GEMINI_TEXT_MODEL_CACHE
 
     except Exception as e:
-        print(f"      (couldn't fetch the live Gemini model list: {e} -- using a fallback list)")
+        print(f"      (couldn't fetch the live Gemini model list: {_describe_google_error(e)} -- using a fallback list)")
 
     _GEMINI_TEXT_MODEL_CACHE = fallback
     return _GEMINI_TEXT_MODEL_CACHE
@@ -365,77 +385,97 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
     Shared helper: calls Gemini (Google AI Studio / Gemini Developer API) for
     text generation, trying free-tier Flash models in order.
 
-    Tries each candidate; moves to the next on any failure (model not
-    available to this key, empty content, degenerate/too-short content,
-    network error, rate limit). Only raises if every candidate fails.
+    On a 429 (rate limit / quota), retries the SAME model with backoff a few
+    times first -- RPM limits are per-model and per-minute, so a short wait
+    usually clears it -- before giving up on that model and trying the next
+    one. On any other failure (model unavailable, empty/degenerate content),
+    moves straight to the next candidate. Only raises if every candidate
+    fails.
     """
+    import time
+    import urllib.error
     import urllib.request
 
     candidates = _get_gemini_text_candidates(api_key)
 
     all_errors = []
-    saw_403_or_429 = False
+    saw_bad_key = False
     for model in candidates:
-        try:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
-            )
-            req = urllib.request.Request(
-                url,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            payload = json.dumps({
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "maxOutputTokens": max_tokens,
-                    "temperature": temperature,
-                },
-            })
-            req.data = payload.encode("utf-8")
-            with urllib.request.urlopen(req, timeout=90) as response:
-                result = json.loads(response.read())
-
-            candidates_out = result.get("candidates", [])
-            content = ""
-            if candidates_out:
-                parts = candidates_out[0].get("content", {}).get("parts", [])
-                content = "".join(p.get("text", "") for p in parts).strip()
-
-            if not content:
-                finish_reason = candidates_out[0].get("finishReason") if candidates_out else "NO_CANDIDATES"
-                msg = f"model '{model}' returned empty content (finishReason: {finish_reason})"
-                print(f"      [{msg} -- trying next]")
-                all_errors.append(msg)
-                continue
-            if len(content) < min_content_length:
-                msg = (
-                    f"model '{model}' returned a suspiciously short/degenerate "
-                    f"response ({len(content)} chars): {content!r}"
+        for attempt in range(3):  # up to 3 tries per model, only for 429s
+            try:
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={api_key}"
                 )
+                req = urllib.request.Request(
+                    url,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                payload = json.dumps({
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {
+                        "maxOutputTokens": max_tokens,
+                        "temperature": temperature,
+                    },
+                })
+                req.data = payload.encode("utf-8")
+                with urllib.request.urlopen(req, timeout=90) as response:
+                    result = json.loads(response.read())
+
+                candidates_out = result.get("candidates", [])
+                content = ""
+                if candidates_out:
+                    parts = candidates_out[0].get("content", {}).get("parts", [])
+                    content = "".join(p.get("text", "") for p in parts).strip()
+
+                if not content:
+                    finish_reason = candidates_out[0].get("finishReason") if candidates_out else "NO_CANDIDATES"
+                    msg = f"model '{model}' returned empty content (finishReason: {finish_reason})"
+                    print(f"      [{msg} -- trying next]")
+                    all_errors.append(msg)
+                    break  # not a rate limit -- no point retrying this model
+                if len(content) < min_content_length:
+                    msg = (
+                        f"model '{model}' returned a suspiciously short/degenerate "
+                        f"response ({len(content)} chars): {content!r}"
+                    )
+                    print(f"      [{msg} -- trying next]")
+                    all_errors.append(msg)
+                    break
+
+                # Small pacing delay after every successful call, to stay
+                # comfortably under the free tier's requests-per-minute cap
+                # instead of only reacting to 429s after they happen.
+                time.sleep(2)
+                return content
+
+            except urllib.error.HTTPError as e:
+                described = _describe_google_error(e)
+                if e.code == 429 and attempt < 2:
+                    wait = 20 * (attempt + 1)
+                    print(f"      [model '{model}' rate-limited (429) -- waiting {wait}s and retrying same model...]")
+                    time.sleep(wait)
+                    continue
+                msg = f"model '{model}' failed: {described}"
                 print(f"      [{msg} -- trying next]")
                 all_errors.append(msg)
-                continue
+                if e.code == 400 and "api key" in described.lower():
+                    saw_bad_key = True
+                break
 
-            return content
+            except Exception as e:
+                msg = f"model '{model}' failed: {e}"
+                print(f"      [{msg} -- trying next]")
+                all_errors.append(msg)
+                break
 
-        except Exception as e:
-            msg = f"model '{model}' failed: {e}"
-            print(f"      [{msg} -- trying next]")
-            all_errors.append(msg)
-            if "403" in str(e) or "429" in str(e):
-                saw_403_or_429 = True
-            continue
-
-    if saw_403_or_429:
+    if saw_bad_key:
         print(
-            "\n      NOTE: Gemini returned a permission/rate-limit error on every "
-            "model tried. Common causes: the GEMINI_API_KEY is wrong or from a "
-            "different Google Cloud project than expected, or you've hit the "
-            "free-tier requests-per-minute/per-day limit and just need to wait a "
-            "bit and try again.\n"
-            "      Check your key and quota at https://aistudio.google.com/apikey\n"
+            "\n      NOTE: Gemini says the API key itself isn't valid. Double-check\n"
+            "      GEMINI_API_KEY was copied in full (no missing/extra characters) from\n"
+            "      https://aistudio.google.com/apikey, and that it's exported in THIS\n"
+            "      terminal session (re-export it if you opened a new terminal).\n"
         )
 
     raise RuntimeError("All Gemini text model candidates failed:\n  - " + "\n  - ".join(all_errors))
@@ -544,7 +584,13 @@ def _get_gemini_image_candidates(api_key):
 
     import urllib.request
 
-    fallback = ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"]
+    # Current as of writing, per Google's own rate-limits page: the stable
+    # Nano Banana image model, falling back to older/preview naming.
+    fallback = [
+        "gemini-2.5-flash-image",
+        "gemini-3-pro-image-preview",
+        "gemini-2.0-flash-preview-image-generation",
+    ]
 
     try:
         url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
@@ -570,11 +616,11 @@ def _get_gemini_image_candidates(api_key):
         if image_ids:
             image_ids.sort(key=len)
             _GEMINI_IMAGE_MODEL_CACHE = image_ids[:3]
-            print(f"      (using {len(_GEMINI_IMAGE_MODEL_CACHE)} Gemini image models currently live for this key)")
+            print(f"      (using {len(_GEMINI_IMAGE_MODEL_CACHE)} Gemini image models currently live for this key: {_GEMINI_IMAGE_MODEL_CACHE})")
             return _GEMINI_IMAGE_MODEL_CACHE
 
     except Exception as e:
-        print(f"      (couldn't fetch the live Gemini image-model list: {e} -- using a fallback list)")
+        print(f"      (couldn't fetch the live Gemini image-model list: {_describe_google_error(e)} -- using a fallback list)")
 
     _GEMINI_IMAGE_MODEL_CACHE = fallback
     return _GEMINI_IMAGE_MODEL_CACHE
@@ -592,9 +638,15 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height, api_ke
     cheap defense-in-depth, but the creative content is the LLM's.
 
     Uses Gemini's image-generation models (Nano Banana family) via the same
-    API key as text generation.
+    API key as text generation. Nano Banana has its own "images per minute"
+    (IPM) limit on the free tier, separate from and usually stricter than the
+    text RPM limit -- so on a 429 we back off and retry the SAME model
+    (an IPM limit clears within the minute) before falling through to a
+    different model.
     """
     import base64
+    import time
+    import urllib.error
     import urllib.request
 
     prompt = (
@@ -609,43 +661,61 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height, api_ke
     candidates = _get_gemini_image_candidates(api_key)
 
     for model in candidates:
-        try:
-            url = (
-                f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
-            )
-            req = urllib.request.Request(
-                url,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            payload = json.dumps({
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"responseModalities": ["IMAGE"]},
-            })
-            req.data = payload.encode("utf-8")
-            with urllib.request.urlopen(req, timeout=90) as response:
-                result = json.loads(response.read())
+        for attempt in range(3):  # up to 3 tries per model, only for 429s (IPM limit)
+            try:
+                url = (
+                    f"https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={api_key}"
+                )
+                req = urllib.request.Request(
+                    url,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                payload = json.dumps({
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"responseModalities": ["IMAGE"]},
+                })
+                req.data = payload.encode("utf-8")
+                with urllib.request.urlopen(req, timeout=90) as response:
+                    result = json.loads(response.read())
 
-            image_bytes = None
-            for cand in result.get("candidates", []):
-                for part in cand.get("content", {}).get("parts", []):
-                    inline = part.get("inlineData") or part.get("inline_data")
-                    if inline and inline.get("data"):
-                        image_bytes = base64.b64decode(inline["data"])
+                image_bytes = None
+                for cand in result.get("candidates", []):
+                    for part in cand.get("content", {}).get("parts", []):
+                        inline = part.get("inlineData") or part.get("inline_data")
+                        if inline and inline.get("data"):
+                            image_bytes = base64.b64decode(inline["data"])
+                            break
+                    if image_bytes:
                         break
-                if image_bytes:
+
+                if image_bytes and len(image_bytes) > 5_000:
+                    with open(out_path, "wb") as f:
+                        f.write(image_bytes)
+                    # Pace proactively -- free-tier Nano Banana's images-per-
+                    # minute limit is tight, so a fixed gap between successful
+                    # generations avoids tripping it in the first place rather
+                    # than only reacting after a 429.
+                    time.sleep(8)
+                    return out_path
+                else:
+                    print(f"      [Gemini model '{model}' returned no usable image data -- trying next]")
                     break
 
-            if image_bytes and len(image_bytes) > 5_000:
-                with open(out_path, "wb") as f:
-                    f.write(image_bytes)
-                return out_path
-            else:
-                print(f"      [Gemini model '{model}' returned no usable image data -- trying next]")
+            except urllib.error.HTTPError as e:
+                described = _describe_google_error(e)
+                if e.code == 429 and attempt < 2:
+                    wait = 20 * (attempt + 1)
+                    print(f"      [model '{model}' rate-limited (429) -- waiting {wait}s and retrying same model...]")
+                    time.sleep(wait)
+                    continue
+                print(f"      [Gemini image model '{model}' failed: {described} -- trying next]")
+                break
 
-        except Exception as e:
-            print(f"      [Gemini image model '{model}' failed: {e} -- trying next]")
+            except Exception as e:
+                print(f"      [Gemini image model '{model}' failed: {e} -- trying next]")
+                break
 
     # --- Every option failed. Do NOT create a placeholder. ---
     return None
