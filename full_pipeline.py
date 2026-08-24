@@ -8,7 +8,9 @@ full_pipeline.py -- The complete chain, one command, script.txt in, video.mp4 ou
         -> background music mixed in underneath
         -> Whisper transcribes the mixed narration for ACCURATE word-level
            caption timing (not guessed/evenly split)
-        -> one image generated per sentence (Pollinations, free, no key)
+        -> full script read + visual style guide generated (Gemini, free tier)
+        -> one detailed, camera-aware image prompt written per sentence (Gemini)
+        -> one image generated per sentence (Gemini image model, free tier)
         -> Ken Burns pan/zoom motion on each image
         -> word-synced captions layered on top
         -> final video.mp4
@@ -18,6 +20,7 @@ USAGE (run this single command on GitHub Codespaces)
 
 ONE-TIME SETUP
     pip install kokoro soundfile moviepy numpy pillow faster-whisper
+    export GEMINI_API_KEY="your-key-from-aistudio.google.com/apikey"
 
 WHY THIS ORDER MATTERS
 Whisper transcribes AFTER narration+music are mixed and boosted, not before --
@@ -231,18 +234,18 @@ def generate_style_guide(script_text, workdir):
 
     print("[0/6] Reading the full script and generating a visual style guide...")
 
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-    if not openrouter_key:
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
         print(
-            "\nSTOPPED: OPENROUTER_API_KEY is not set, so a style guide can't be generated.\n"
-            "Set it with: export OPENROUTER_API_KEY=\"your-key-here\"\n"
+            "\nSTOPPED: GEMINI_API_KEY is not set, so a style guide can't be generated.\n"
+            "Set it with: export GEMINI_API_KEY=\"your-key-here\"\n"
             "Then run this exact same command again -- narration, audio, and captions\n"
             "are already saved and will be reused automatically.\n"
         )
         sys.exit(1)
 
     try:
-        script_understanding = read_full_script(script_text, workdir, openrouter_key)
+        script_understanding = read_full_script(script_text, workdir, gemini_key)
 
         prompt = (
             "You are a visual style consultant for a YouTube documentary channel made "
@@ -268,7 +271,7 @@ def generate_style_guide(script_text, workdir):
             f"SCRIPT / SCRIPT NOTES:\n{script_understanding}"
         )
 
-        generated = call_llm(prompt, openrouter_key, max_tokens=350, temperature=0.7, min_content_length=60)
+        generated = call_llm(prompt, gemini_key, max_tokens=350, temperature=0.7, min_content_length=60)
 
         if len(generated) > 20:
             print(f"      Style guide generated ({len(generated)} chars)")
@@ -301,166 +304,141 @@ def split_sentences(text):
     return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
 
 
-_FREE_MODEL_CACHE = None  # fetched once per run, reused by every call_llm() call
+_GEMINI_TEXT_MODEL_CACHE = None  # fetched once per run, reused by every call_llm() call
 
 
-def _get_free_model_candidates(api_key):
+def _get_gemini_text_candidates(api_key):
     """
-    Asks OpenRouter for its CURRENT list of $0 models and returns a handful
-    of candidates to try, largest/most-capable first. Cached in-memory so
-    this only hits the network once per run of the pipeline, not once per
-    sentence.
+    Asks Google for the CURRENT list of Gemini models available to this key
+    and picks out text-capable ones (Flash-class, since that's what's free),
+    fastest/cheapest first. Cached in-memory so this only hits the network
+    once per run of the pipeline, not once per sentence.
 
     Falls back to a hardcoded list (current as of writing) only if the live
-    lookup itself fails -- e.g. a brief network hiccup to openrouter.ai.
+    lookup itself fails.
     """
-    global _FREE_MODEL_CACHE
-    if _FREE_MODEL_CACHE is not None:
-        return _FREE_MODEL_CACHE
+    global _GEMINI_TEXT_MODEL_CACHE
+    if _GEMINI_TEXT_MODEL_CACHE is not None:
+        return _GEMINI_TEXT_MODEL_CACHE
 
     import urllib.request
 
-    fallback = [
-        "nvidia/nemotron-nano-9b-v2:free",
-        "nvidia/nemotron-3-nano-30b-a3b:free",
-        "cohere/north-mini-code:free",
-        "z-ai/glm-5.2:free",
-        "nvidia/nemotron-3-super-120b-a12b:free",
-    ]
+    fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3-flash-lite"]
 
     try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as response:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        with urllib.request.urlopen(url, timeout=30) as response:
             data = json.loads(response.read())
 
-        free_ids = []
-        for m in data.get("data", []):
-            model_id = m.get("id", "")
-            pricing = m.get("pricing", {})
-            if model_id.endswith(":free") and pricing.get("prompt") in ("0", 0):
-                free_ids.append(model_id)
+        text_ids = []
+        for m in data.get("models", []):
+            name = m.get("name", "").replace("models/", "")
+            methods = m.get("supportedGenerationMethods", [])
+            lname = name.lower()
+            if (
+                "generateContent" in methods
+                and "flash" in lname
+                and "image" not in lname
+                and "embedding" not in lname
+                and "tts" not in lname
+                and "vision" not in lname
+            ):
+                text_ids.append(name)
 
-        if free_ids:
-            # A handful is enough -- we just need options to fall through to
-            # if one is rate-limited or misbehaves for this particular call.
-            _FREE_MODEL_CACHE = free_ids[:6]
-            print(f"      (using {len(_FREE_MODEL_CACHE)} free models currently live on OpenRouter)")
-            return _FREE_MODEL_CACHE
+        if text_ids:
+            # Prefer plain "flash" over "flash-lite"/"flash-8b" variants by
+            # sorting shorter names first (usually the more capable default).
+            text_ids.sort(key=len)
+            _GEMINI_TEXT_MODEL_CACHE = text_ids[:5]
+            print(f"      (using {len(_GEMINI_TEXT_MODEL_CACHE)} Gemini text models currently live for this key)")
+            return _GEMINI_TEXT_MODEL_CACHE
 
     except Exception as e:
-        print(f"      (couldn't fetch the live free-model list from OpenRouter: {e} -- using a fallback list)")
+        print(f"      (couldn't fetch the live Gemini model list: {e} -- using a fallback list)")
 
-    _FREE_MODEL_CACHE = fallback
-    return _FREE_MODEL_CACHE
+    _GEMINI_TEXT_MODEL_CACHE = fallback
+    return _GEMINI_TEXT_MODEL_CACHE
 
 
 def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_length=20):
     """
-    Shared helper: calls a free LLM via OpenRouter, trying a short list of
-    known-stable non-reasoning free models in order (not the auto-router,
-    which can unpredictably land on a reasoning model whose actual output
-    lives in a different field than "content", leaving content empty).
+    Shared helper: calls Gemini (Google AI Studio / Gemini Developer API) for
+    text generation, trying free-tier Flash models in order.
 
-    Tries each candidate; moves to the next on any failure (404, empty
-    content, degenerate/too-short content, network error). Only raises if
-    every candidate fails.
-
-    IMPORTANT: some free models occasionally return a bare moderation/safety
-    verdict (e.g. "User Safety: safe") instead of actually completing the
-    request. That string is technically non-empty, so checking only for
-    emptiness let it slip through as if it were a real answer. We guard
-    against that by also requiring the response to be at least
-    `min_content_length` characters -- short enough not to reject genuinely
-    brief real answers, but long enough to catch degenerate non-answers like
-    that one -- and fall through to the next candidate model when it happens,
-    instead of returning the garbage.
+    Tries each candidate; moves to the next on any failure (model not
+    available to this key, empty content, degenerate/too-short content,
+    network error, rate limit). Only raises if every candidate fails.
     """
     import urllib.request
 
-    # The free-model roster on OpenRouter rotates constantly -- models that
-    # worked last month can 404 today. So instead of trusting a hardcoded
-    # list of names, ask OpenRouter what's free RIGHT NOW and use that. Only
-    # falls back to a hardcoded list if that lookup itself fails (e.g. no
-    # network to openrouter.ai for a moment).
-    candidates = _get_free_model_candidates(api_key)
+    candidates = _get_gemini_text_candidates(api_key)
 
-    # Almost every current free model is a REASONING model: it thinks
-    # step-by-step internally before answering. Two defenses against that
-    # leaking into our output: (1) tell OpenRouter to strip reasoning tokens
-    # from the response entirely, and (2) for NVIDIA Nemotron models
-    # specifically, their own docs say a system message can turn extended
-    # thinking off outright. Both are harmless no-ops on models that don't
-    # support them.
-    system_msg = {"role": "system", "content": "detailed thinking off"}
-
-    # Phrases that only show up when a reasoning model's internal scratchpad
-    # leaks into the answer instead of the finished response. If content
-    # starts this way, it's not a real answer -- reject it and move on,
-    # regardless of length.
-    reasoning_leak_markers = (
-        "we need to output", "we need to produce", "let's craft", "let's think",
-        "the user wants", "the user gave", "output only the notes",
-    )
-
-    # Reasoning models spend part of max_tokens on hidden thinking even when
-    # "exclude" is set, so give real headroom -- otherwise the final answer
-    # gets cut off before it's ever written, same failure as before just
-    # hidden instead of visible.
-    effective_max_tokens = max(max_tokens * 4, 600)
-
-    last_error = None
+    all_errors = []
+    saw_403_or_429 = False
     for model in candidates:
         try:
-            url = "https://openrouter.ai/api/v1/chat/completions"
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
             req = urllib.request.Request(
                 url,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                headers={"Content-Type": "application/json"},
                 method="POST",
             )
             payload = json.dumps({
-                "model": model,
-                "messages": [system_msg, {"role": "user", "content": prompt}],
-                "max_tokens": effective_max_tokens,
-                "temperature": temperature,
-                # If this model has a reasoning mode, strip its reasoning
-                # tokens from the response entirely -- only the final answer
-                # should come back in "content".
-                "reasoning": {"exclude": True},
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "temperature": temperature,
+                },
             })
             req.data = payload.encode("utf-8")
             with urllib.request.urlopen(req, timeout=90) as response:
                 result = json.loads(response.read())
 
-            content = result["choices"][0]["message"].get("content")
-            content = content.strip() if content else ""
+            candidates_out = result.get("candidates", [])
+            content = ""
+            if candidates_out:
+                parts = candidates_out[0].get("content", {}).get("parts", [])
+                content = "".join(p.get("text", "") for p in parts).strip()
 
             if not content:
-                last_error = f"model '{model}' returned empty/null content"
+                finish_reason = candidates_out[0].get("finishReason") if candidates_out else "NO_CANDIDATES"
+                msg = f"model '{model}' returned empty content (finishReason: {finish_reason})"
+                print(f"      [{msg} -- trying next]")
+                all_errors.append(msg)
                 continue
             if len(content) < min_content_length:
-                last_error = (
+                msg = (
                     f"model '{model}' returned a suspiciously short/degenerate "
-                    f"response ({len(content)} chars, likely a moderation-only "
-                    f"reply rather than a real answer): {content!r}"
+                    f"response ({len(content)} chars): {content!r}"
                 )
-                continue
-            if content.lower().startswith(reasoning_leak_markers):
-                last_error = (
-                    f"model '{model}' leaked internal reasoning instead of a real "
-                    f"answer: {content[:80]!r}..."
-                )
+                print(f"      [{msg} -- trying next]")
+                all_errors.append(msg)
                 continue
 
             return content
 
         except Exception as e:
-            last_error = f"model '{model}' failed: {e}"
+            msg = f"model '{model}' failed: {e}"
+            print(f"      [{msg} -- trying next]")
+            all_errors.append(msg)
+            if "403" in str(e) or "429" in str(e):
+                saw_403_or_429 = True
             continue
 
-    raise RuntimeError(f"All free model candidates failed. Last error: {last_error}")
+    if saw_403_or_429:
+        print(
+            "\n      NOTE: Gemini returned a permission/rate-limit error on every "
+            "model tried. Common causes: the GEMINI_API_KEY is wrong or from a "
+            "different Google Cloud project than expected, or you've hit the "
+            "free-tier requests-per-minute/per-day limit and just need to wait a "
+            "bit and try again.\n"
+            "      Check your key and quota at https://aistudio.google.com/apikey\n"
+        )
+
+    raise RuntimeError("All Gemini text model candidates failed:\n  - " + "\n  - ".join(all_errors))
 
 
 def generate_image_prompts(sentences, style_guide, script_text, workdir):
@@ -478,9 +456,9 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
 
     print(f"[0.5/6] Generating individual image prompts for {len(sentences)} sentences...")
 
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-    if not openrouter_key:
-        print("\nSTOPPED: OPENROUTER_API_KEY is not set.\n")
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        print("\nSTOPPED: GEMINI_API_KEY is not set.\n")
         sys.exit(1)
 
     # Loop sentence by sentence -- the response IS the string!
@@ -532,7 +510,7 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
         final_prompt = None
         for attempt in range(1, 3):
             try:
-                raw = call_llm(prompt, openrouter_key, max_tokens=180, temperature=0.6, min_content_length=25)
+                raw = call_llm(prompt, gemini_key, max_tokens=180, temperature=0.6, min_content_length=25)
                 # Clean up any accidental wrapping quotes or markdown
                 cleaned = raw.strip().strip('"').strip("'")
                 if len(cleaned) > 10:
@@ -552,7 +530,57 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
     print(f"      Successfully generated all {len(all_prompts)} prompts sentence-by-sentence.")
     return all_prompts
 
-def generate_image_for_sentence(authored_prompt, out_path, width, height):
+_GEMINI_IMAGE_MODEL_CACHE = None  # fetched once per run, reused by every call
+
+
+def _get_gemini_image_candidates(api_key):
+    """
+    Same live-discovery approach as _get_gemini_text_candidates, but for
+    image-generation-capable models (Nano Banana / Gemini image models).
+    """
+    global _GEMINI_IMAGE_MODEL_CACHE
+    if _GEMINI_IMAGE_MODEL_CACHE is not None:
+        return _GEMINI_IMAGE_MODEL_CACHE
+
+    import urllib.request
+
+    fallback = ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"]
+
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = json.loads(response.read())
+
+        image_ids = []
+        for m in data.get("models", []):
+            name = m.get("name", "").replace("models/", "")
+            methods = m.get("supportedGenerationMethods", [])
+            lname = name.lower()
+            if "generateContent" in methods and "image" in lname and "preview" not in lname:
+                image_ids.append(name)
+        if not image_ids:
+            # Some accounts only expose the preview naming -- accept that too
+            # as a second pass rather than going straight to the hardcoded list.
+            for m in data.get("models", []):
+                name = m.get("name", "").replace("models/", "")
+                methods = m.get("supportedGenerationMethods", [])
+                if "generateContent" in methods and "image" in name.lower():
+                    image_ids.append(name)
+
+        if image_ids:
+            image_ids.sort(key=len)
+            _GEMINI_IMAGE_MODEL_CACHE = image_ids[:3]
+            print(f"      (using {len(_GEMINI_IMAGE_MODEL_CACHE)} Gemini image models currently live for this key)")
+            return _GEMINI_IMAGE_MODEL_CACHE
+
+    except Exception as e:
+        print(f"      (couldn't fetch the live Gemini image-model list: {e} -- using a fallback list)")
+
+    _GEMINI_IMAGE_MODEL_CACHE = fallback
+    return _GEMINI_IMAGE_MODEL_CACHE
+
+
+def generate_image_for_sentence(authored_prompt, out_path, width, height, api_key):
     """
     Returns the path on success, or None if every real option failed.
     NEVER writes a placeholder -- a placeholder in the final video is
@@ -562,69 +590,64 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height):
     contextual prompt written by an LLM that read the whole script, not a
     generic template. We still append a technical/safety suffix here as
     cheap defense-in-depth, but the creative content is the LLM's.
+
+    Uses Gemini's image-generation models (Nano Banana family) via the same
+    API key as text generation.
     """
-    import time
+    import base64
+    import urllib.request
 
     prompt = (
         f"{authored_prompt} "
         f"photorealistic, shot on DSLR camera, natural lighting, real photography, "
         f"no illustration, no digital art, no CGI, no text, no watermark, "
         f"no fashion photography, no character portrait, no model posing, "
-        f"no stylized rendering, editorial photojournalism only"
+        f"no stylized rendering, editorial photojournalism only. "
+        f"Aspect ratio matching {width}x{height}."
     )
 
-    # --- Option 1: Pollinations.ai (free, no key, rate-paced) ---
-    try:
-        import urllib.parse
-        import urllib.request
+    candidates = _get_gemini_image_candidates(api_key)
 
-        encoded = urllib.parse.quote(prompt)
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            },
-        )
-        with urllib.request.urlopen(req, timeout=60) as response, open(out_path, "wb") as f:
-            f.write(response.read())
-        size = Path(out_path).stat().st_size
-        if 10_000 < size < 1_000_000:
-            time.sleep(15)
-            return out_path
-        else:
-            print(f"      [Pollinations suspicious size ({size} bytes) -- likely rate-limited, trying next option]")
-            Path(out_path).unlink(missing_ok=True)
-    except Exception as e:
-        print(f"      [Pollinations request failed: {e} -- trying next option]")
-
-    # --- Option 2: Hugging Face Inference API (free, needs HF_API_TOKEN) ---
-    hf_token = os.environ.get("HF_API_TOKEN")
-    if hf_token:
+    for model in candidates:
         try:
-            import urllib.request
-
-            hf_url = "https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell"
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
             req = urllib.request.Request(
-                hf_url,
-                headers={"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"},
+                url,
+                headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            req.data = f'{{"inputs": {prompt!r}}}'.encode("utf-8")
-            with urllib.request.urlopen(req, timeout=60) as response:
-                data = response.read()
-            if len(data) > 10_000:
+            payload = json.dumps({
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"responseModalities": ["IMAGE"]},
+            })
+            req.data = payload.encode("utf-8")
+            with urllib.request.urlopen(req, timeout=90) as response:
+                result = json.loads(response.read())
+
+            image_bytes = None
+            for cand in result.get("candidates", []):
+                for part in cand.get("content", {}).get("parts", []):
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        image_bytes = base64.b64decode(inline["data"])
+                        break
+                if image_bytes:
+                    break
+
+            if image_bytes and len(image_bytes) > 5_000:
                 with open(out_path, "wb") as f:
-                    f.write(data)
+                    f.write(image_bytes)
                 return out_path
             else:
-                print("      [Hugging Face returned unexpectedly small data]")
-        except Exception as e:
-            print(f"      [Hugging Face request failed: {e}]")
-    else:
-        print("      [HF_API_TOKEN not set -- Hugging Face fallback unavailable]")
+                print(f"      [Gemini model '{model}' returned no usable image data -- trying next]")
 
-    # --- Both real options failed. Do NOT create a placeholder. ---
+        except Exception as e:
+            print(f"      [Gemini image model '{model}' failed: {e} -- trying next]")
+
+    # --- Every option failed. Do NOT create a placeholder. ---
     return None
 
 
@@ -741,6 +764,17 @@ def main():
     duration = audio_clip.duration
     total_words = sum(len(s.split()) for s in sentences) or 1
 
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        print(
+            "\nSTOPPED: GEMINI_API_KEY is not set, so images can't be generated.\n"
+            "Set it with: export GEMINI_API_KEY=\"your-key-here\"\n"
+            "Then run this exact same command again -- narration, audio, captions,\n"
+            "the style guide, and all written prompts are already saved and will be\n"
+            "reused automatically.\n"
+        )
+        sys.exit(1)
+
     print(f"[5/6] Generating {len(sentences)} images with Ken Burns motion...")
     beat_clips = []
     t_cursor = 0.0
@@ -764,10 +798,10 @@ def main():
             print(f"      [{i+1}/{len(sentences)}] already generated, skipping: {img_path.name}")
         else:
             print(f"      [{i+1}/{len(sentences)}] generating image for sentence {i+1}...")
-            result = generate_image_for_sentence(image_prompts[i], img_path, width, height)
+            result = generate_image_for_sentence(image_prompts[i], img_path, width, height, gemini_key)
             if result is None:
                 print(
-                    f"\nSTOPPED at sentence {i+1}/{len(sentences)}: both Pollinations and Hugging Face "
+                    f"\nSTOPPED at sentence {i+1}/{len(sentences)}: every Gemini image model "
                     f"failed to generate a real image for this sentence.\n"
                     f"No placeholder was used -- nothing unusable will end up in your video.\n"
                     f"Everything completed so far (narration, music, captions, and "
