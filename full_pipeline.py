@@ -324,11 +324,30 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
     """
     import urllib.request
 
+    # Plain instruct models FIRST -- these answer directly, no internal
+    # "thinking out loud" step. The gpt-oss / nemotron models are REASONING
+    # models: they think step-by-step before answering, and on the free tier
+    # that internal reasoning can consume the whole max_tokens budget and/or
+    # leak into the "content" field as raw scratchpad text (e.g. "We need to
+    # output..."). They're kept as a last-resort fallback only, with
+    # reasoning explicitly excluded below.
     candidates = [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "mistralai/mistral-small-3.1-24b-instruct:free",
         "openai/gpt-oss-20b:free",
         "nvidia/nemotron-3-nano-30b-a3b:free",
         "openai/gpt-oss-120b:free",
     ]
+
+    # Phrases that only show up when a reasoning model's internal scratchpad
+    # leaks into the answer instead of the finished response. If content
+    # starts this way, it's not a real answer -- reject it and move on,
+    # regardless of length.
+    reasoning_leak_markers = (
+        "we need to output", "we need to produce", "let's craft", "let's think",
+        "the user wants", "the user gave", "output only the notes",
+    )
+
     last_error = None
     for model in candidates:
         try:
@@ -343,6 +362,10 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                # If this model has a reasoning mode, strip its reasoning
+                # tokens from the response entirely -- only the final answer
+                # should come back in "content".
+                "reasoning": {"exclude": True},
             })
             req.data = payload.encode("utf-8")
             with urllib.request.urlopen(req, timeout=90) as response:
@@ -359,6 +382,12 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
                     f"model '{model}' returned a suspiciously short/degenerate "
                     f"response ({len(content)} chars, likely a moderation-only "
                     f"reply rather than a real answer): {content!r}"
+                )
+                continue
+            if content.lower().startswith(reasoning_leak_markers):
+                last_error = (
+                    f"model '{model}' leaked internal reasoning instead of a real "
+                    f"answer: {content[:80]!r}..."
                 )
                 continue
 
