@@ -688,7 +688,7 @@ def _get_gemini_image_candidates(api_key):
 
         if image_ids:
             image_ids.sort(key=len)
-            _GEMINI_IMAGE_MODEL_CACHE = image_ids[:3]
+            _GEMINI_IMAGE_MODEL_CACHE = image_ids[:5]
             print(f"      (using {len(_GEMINI_IMAGE_MODEL_CACHE)} Gemini image models currently live for this key: {_GEMINI_IMAGE_MODEL_CACHE})")
             return _GEMINI_IMAGE_MODEL_CACHE
 
