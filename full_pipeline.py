@@ -327,6 +327,27 @@ def _describe_google_error(e):
 _GEMINI_TEXT_MODEL_CACHE = None  # fetched once per run, reused by every call_llm() call
 
 
+def _parse_quota_signal(error_text):
+    """
+    Google's 429 responses aren't just 'rate limited' -- they include the
+    actual quota metric and its limit, and often a precise retry delay. Two
+    very different situations produce the same HTTP 429:
+      - "limit: 20" (or any N > 0): a real, small quota that WILL refill --
+        worth a short wait.
+      - "limit: 0": this model has NO free-tier quota on this key AT ALL.
+        No amount of waiting fixes that -- it needs to be permanently
+        skipped, not retried.
+    Returns (limit_is_zero: bool, retry_after_seconds: float | None).
+    """
+    limit_is_zero = bool(re.search(r"limit:\s*0\b", error_text))
+    retry_match = re.search(r"retry in ([\d.]+)s", error_text, re.IGNORECASE)
+    retry_after = float(retry_match.group(1)) if retry_match else None
+    return limit_is_zero, retry_after
+
+
+_PERMANENTLY_UNAVAILABLE_MODELS = set()  # models confirmed limit:0 -- never retry these again this run
+
+
 def _get_gemini_text_candidates(api_key):
     """
     Asks Google for the CURRENT list of Gemini models available to this key
@@ -435,6 +456,7 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
     import urllib.request
 
     all_candidates = _get_gemini_text_candidates(api_key)
+    all_candidates = [m for m in all_candidates if m not in _PERMANENTLY_UNAVAILABLE_MODELS] or all_candidates
     idx = _GEMINI_TEXT_ROTATION_INDEX % len(all_candidates)
     candidates = all_candidates[idx:] + all_candidates[:idx]
     _GEMINI_TEXT_ROTATION_INDEX += 1
@@ -502,7 +524,12 @@ def call_llm(prompt, api_key, max_tokens=200, temperature=0.7, min_content_lengt
         except urllib.error.HTTPError as e:
             described = _describe_google_error(e)
             if e.code == 429:
-                print(f"      [model '{model}' rate-limited/quota-exhausted (429) -- moving to next model]")
+                limit_is_zero, _ = _parse_quota_signal(described)
+                if limit_is_zero:
+                    print(f"      [model '{model}' has ZERO free-tier quota on this key -- permanently skipping it]")
+                    _PERMANENTLY_UNAVAILABLE_MODELS.add(model)
+                else:
+                    print(f"      [model '{model}' rate-limited/quota-exhausted (429) -- moving to next model]")
             else:
                 print(f"      [model '{model}' failed: {described} -- trying next]")
             all_errors.append(f"model '{model}' failed: {described}")
@@ -704,10 +731,10 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height, api_ke
         f"Aspect ratio matching {width}x{height}."
     )
 
-    candidates = _get_gemini_image_candidates(api_key)
+    candidates = [m for m in _get_gemini_image_candidates(api_key) if m not in _PERMANENTLY_UNAVAILABLE_MODELS]
 
     for model in candidates:
-        for attempt in range(3):  # up to 3 tries per model, only for 429s (IPM limit)
+        for attempt in range(2):  # a couple of tries per model, only when the wait is worth it
             try:
                 url = (
                     f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -751,11 +778,24 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height, api_ke
 
             except urllib.error.HTTPError as e:
                 described = _describe_google_error(e)
-                if e.code == 429 and attempt < 2:
-                    wait = 20 * (attempt + 1)
-                    print(f"      [model '{model}' rate-limited (429) -- waiting {wait}s and retrying same model...]")
-                    time.sleep(wait)
-                    continue
+                if e.code == 429:
+                    limit_is_zero, retry_after = _parse_quota_signal(described)
+                    if limit_is_zero:
+                        # Not a rate limit -- this model has NO quota on this
+                        # key at all. Waiting can never fix that. Blacklist it
+                        # permanently for the rest of this run and move on
+                        # immediately, no sleep wasted.
+                        print(f"      [model '{model}' has ZERO free-tier quota on this key -- permanently skipping it]")
+                        _PERMANENTLY_UNAVAILABLE_MODELS.add(model)
+                        break
+                    if attempt == 0 and retry_after is not None and retry_after < 30:
+                        # A real quota that will genuinely refill soon --
+                        # Google told us exactly how long, so wait that long,
+                        # not a guessed number.
+                        wait = retry_after + 1
+                        print(f"      [model '{model}' rate-limited -- Google says retry in {retry_after:.0f}s, waiting {wait:.0f}s...]")
+                        time.sleep(wait)
+                        continue
                 print(f"      [Gemini image model '{model}' failed: {described} -- trying next]")
                 break
 
@@ -763,7 +803,32 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height, api_ke
                 print(f"      [Gemini image model '{model}' failed: {e} -- trying next]")
                 break
 
-    # --- Every option failed. Do NOT create a placeholder. ---
+    # --- Every Gemini image model failed or is permanently unavailable on
+    # this key. Try Pollinations.ai as a genuinely independent second
+    # provider -- no key, no shared quota with Gemini, so it's not just
+    # "the same failure again." ---
+    try:
+        import urllib.parse
+
+        encoded = urllib.parse.quote(prompt)
+        poll_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true"
+        req = urllib.request.Request(
+            poll_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            data = response.read()
+        if len(data) > 10_000:
+            with open(out_path, "wb") as f:
+                f.write(data)
+            time.sleep(5)
+            return out_path
+        else:
+            print(f"      [Pollinations fallback returned suspiciously small data ({len(data)} bytes)]")
+    except Exception as e:
+        print(f"      [Pollinations fallback also failed: {e}]")
+
+    # --- Every real option failed. Do NOT create a placeholder. ---
     return None
 
 
