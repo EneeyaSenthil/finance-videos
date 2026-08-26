@@ -9,15 +9,17 @@ A high-CTR thumbnail needs a deliberately chosen "money shot" -- the single
 most curiosity-driving visual moment in the story -- not whichever beat
 image happened to land in the middle third of the video. Since the LLM
 already read your entire script to build the style guide, it's in a much
-better position to identify that moment than a random pick.
+better position to identify that moment than a random pick. Uses the same
+Gemini-based text and image generation as the main pipeline (GEMINI_API_KEY).
 
 ON TEXT/TITLE CONTROL -- IMPORTANT
 The LLM SUGGESTS 3 short candidate titles. It never picks for you. You
 always choose or rewrite the final text yourself via --text.
 
 TWO-STEP WORKFLOW
-  Step 1: get title suggestions (no image generated yet, fast)
-      python thumbnail_maker.py --get-titles --script script.txt --workdir pipeline_tmp
+  Step 1: get title suggestions (no image generated yet, fast) -- just
+  leave out --text and it stops after showing suggestions:
+      python thumbnail_maker.py --script script.txt --workdir pipeline_tmp
 
   Step 2: once you've picked/written your title, generate the real thumbnails
       python thumbnail_maker.py --script script.txt --workdir pipeline_tmp --text "YOUR CHOSEN TITLE"
@@ -77,11 +79,11 @@ def generate_thumbnail_concept(script_text, style_guide, workdir):
 
     print("Analyzing your script for the strongest thumbnail concept...")
 
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-    if not openrouter_key:
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
         print(
-            "\nSTOPPED: OPENROUTER_API_KEY is not set, so a thumbnail concept can't be generated.\n"
-            "Set it with: export OPENROUTER_API_KEY=\"your-key-here\"\n"
+            "\nSTOPPED: GEMINI_API_KEY is not set, so a thumbnail concept can't be generated.\n"
+            "Set it with: export GEMINI_API_KEY=\"your-key-here\"\n"
         )
         sys.exit(1)
 
@@ -105,7 +107,7 @@ def generate_thumbnail_concept(script_text, style_guide, workdir):
 
     try:
         import re
-        raw = call_llm(prompt, openrouter_key, max_tokens=400, temperature=0.8)
+        raw = call_llm(prompt, gemini_key, max_tokens=400, temperature=0.8, min_content_length=40)
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
         data = json.loads(cleaned)
 
@@ -231,6 +233,14 @@ def main():
         )
         sys.exit(1)
 
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        print(
+            "\nSTOPPED: GEMINI_API_KEY is not set.\n"
+            "Set it with: export GEMINI_API_KEY=\"your-key-here\"\n"
+        )
+        sys.exit(1)
+
     script_text = Path(args.script).read_text(encoding="utf-8")
     style_guide = style_guide_path.read_text(encoding="utf-8")
 
@@ -253,12 +263,12 @@ def main():
         print(f"Concept image already generated, skipping: {concept_image_path}")
     else:
         print("Generating the dedicated thumbnail concept image...")
-        result = generate_image_for_sentence(image_prompt, concept_image_path, THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1])
+        result = generate_image_for_sentence(image_prompt, concept_image_path, THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], gemini_key)
         if result is None:
             print(
-                "\nSTOPPED: couldn't generate the thumbnail concept image (both Pollinations "
-                "and Hugging Face failed). No placeholder was used. Run this exact same "
-                "command again in a little while.\n"
+                "\nSTOPPED: couldn't generate the thumbnail concept image -- every Gemini "
+                "image model and the Pollinations fallback all failed. No placeholder was "
+                "used. Run this exact same command again in a little while.\n"
             )
             sys.exit(1)
 
