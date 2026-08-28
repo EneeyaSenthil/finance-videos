@@ -267,8 +267,9 @@ def main():
         if result is None:
             print(
                 "\nSTOPPED: couldn't generate the thumbnail concept image -- every Gemini "
-                "image model and the Pollinations fallback all failed. No placeholder was "
-                "used. Run this exact same command again in a little while.\n"
+                "image model on this key is currently rate-limited or out of quota. No "
+                "placeholder was used and no lower-quality fallback was used either. Wait "
+                "for your quota to refresh, then run this exact same command again.\n"
             )
             sys.exit(1)
 

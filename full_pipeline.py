@@ -804,31 +804,10 @@ def generate_image_for_sentence(authored_prompt, out_path, width, height, api_ke
                 break
 
     # --- Every Gemini image model failed or is permanently unavailable on
-    # this key. Try Pollinations.ai as a genuinely independent second
-    # provider -- no key, no shared quota with Gemini, so it's not just
-    # "the same failure again." ---
-    try:
-        import urllib.parse
-
-        encoded = urllib.parse.quote(prompt)
-        poll_url = f"https://image.pollinations.ai/prompt/{encoded}?width={width}&height={height}&nologo=true"
-        req = urllib.request.Request(
-            poll_url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as response:
-            data = response.read()
-        if len(data) > 10_000:
-            with open(out_path, "wb") as f:
-                f.write(data)
-            time.sleep(5)
-            return out_path
-        else:
-            print(f"      [Pollinations fallback returned suspiciously small data ({len(data)} bytes)]")
-    except Exception as e:
-        print(f"      [Pollinations fallback also failed: {e}]")
-
-    # --- Every real option failed. Do NOT create a placeholder. ---
+    # this key today. Deliberately NO fallback to a weaker free provider here
+    # -- a lower-quality generator silently substituting for Nano Banana
+    # produces inconsistent, sometimes garbled results. Better to stop
+    # cleanly and let the person resume once quota actually refills. ---
     return None
 
 
