@@ -1,0 +1,31 @@
+{
+  "trends_geo": "US",
+  "keyword_planner_csv": null,
+  "topics": [
+    "Roth IRA vs 401k",
+    "credit card churning",
+    "best high yield savings account",
+    "how to refinance mortgage",
+    "index fund investing for beginners",
+    "life insurance vs term insurance",
+    "how to pay off debt fast",
+    "tax loss harvesting",
+    "best cash back credit card",
+    "HELOC explained",
+    "retirement withdrawal strategy",
+    "stock brokerage comparison",
+    "how to build credit score fast",
+    "business loan for small business",
+    "emergency fund how much"
+  ],
+  "competitor_channels": [
+    "https://www.youtube.com/@GrahamStephan/videos",
+    "https://www.youtube.com/@TheMoneyGuyShow/videos",
+    "https://www.youtube.com/@newmoney/videos",
+    "https://www.youtube.com/@GirlTalkWithMS/videos",
+    "https://www.youtube.com/@NerdWallet/videos"
+  ],
+  "breakout_lookback_days": 60,
+  "breakout_multiplier": 2.0,
+  "youtube_search_results_per_topic": 15
+}
