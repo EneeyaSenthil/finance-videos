@@ -263,13 +263,12 @@ def main():
         print(f"Concept image already generated, skipping: {concept_image_path}")
     else:
         print("Generating the dedicated thumbnail concept image...")
-        result = generate_image_for_sentence(image_prompt, concept_image_path, THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1], gemini_key)
+        result = generate_image_for_sentence(image_prompt, concept_image_path, THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1])
         if result is None:
             print(
-                "\nSTOPPED: couldn't generate the thumbnail concept image -- every Gemini "
-                "image model on this key is currently rate-limited or out of quota. No "
-                "placeholder was used and no lower-quality fallback was used either. Wait "
-                "for your quota to refresh, then run this exact same command again.\n"
+                "\nSTOPPED: couldn't generate the thumbnail concept image -- Pollinations "
+                "failed after multiple attempts. No placeholder was used. Run this exact "
+                "same command again in a little while.\n"
             )
             sys.exit(1)
 

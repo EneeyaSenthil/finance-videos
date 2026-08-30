@@ -10,7 +10,8 @@ full_pipeline.py -- The complete chain, one command, script.txt in, video.mp4 ou
            caption timing (not guessed/evenly split)
         -> full script read + visual style guide generated (Gemini, free tier)
         -> one detailed, camera-aware image prompt written per sentence (Gemini)
-        -> one image generated per sentence (Gemini image model, free tier)
+        -> one image generated per sentence (Pollinations.ai, free, no key --
+           Gemini's own image models were checked and have NO free tier)
         -> Ken Burns pan/zoom motion on each image
         -> word-synced captions layered on top
         -> final video.mp4
@@ -21,6 +22,7 @@ USAGE (run this single command on GitHub Codespaces)
 ONE-TIME SETUP
     pip install kokoro soundfile moviepy numpy pillow faster-whisper
     export GEMINI_API_KEY="your-key-from-aistudio.google.com/apikey"
+    (no key needed for images -- Pollinations.ai is used, free and keyless)
 
 WHY THIS ORDER MATTERS
 Whisper transcribes AFTER narration+music are mixed and boosted, not before --
@@ -643,171 +645,99 @@ def generate_image_prompts(sentences, style_guide, script_text, workdir):
     print(f"      Successfully generated all {len(all_prompts)} prompts sentence-by-sentence.")
     return all_prompts
 
-_GEMINI_IMAGE_MODEL_CACHE = None  # fetched once per run, reused by every call
-
-
-def _get_gemini_image_candidates(api_key):
+def generate_image_for_sentence(authored_prompt, out_path, width, height):
     """
-    Same live-discovery approach as _get_gemini_text_candidates, but for
-    image-generation-capable models (Nano Banana / Gemini image models).
-    """
-    global _GEMINI_IMAGE_MODEL_CACHE
-    if _GEMINI_IMAGE_MODEL_CACHE is not None:
-        return _GEMINI_IMAGE_MODEL_CACHE
-
-    import urllib.request
-
-    # Current as of writing, per Google's own rate-limits page: the stable
-    # Nano Banana image model, falling back to older/preview naming.
-    fallback = [
-        "gemini-2.5-flash-image",
-        "gemini-3-pro-image-preview",
-        "gemini-2.0-flash-preview-image-generation",
-    ]
-
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        with urllib.request.urlopen(url, timeout=30) as response:
-            data = json.loads(response.read())
-
-        image_ids = []
-        for m in data.get("models", []):
-            name = m.get("name", "").replace("models/", "")
-            methods = m.get("supportedGenerationMethods", [])
-            lname = name.lower()
-            if "generateContent" in methods and "image" in lname and "preview" not in lname:
-                image_ids.append(name)
-        if not image_ids:
-            # Some accounts only expose the preview naming -- accept that too
-            # as a second pass rather than going straight to the hardcoded list.
-            for m in data.get("models", []):
-                name = m.get("name", "").replace("models/", "")
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods and "image" in name.lower():
-                    image_ids.append(name)
-
-        if image_ids:
-            image_ids.sort(key=len)
-            _GEMINI_IMAGE_MODEL_CACHE = image_ids[:5]
-            print(f"      (using {len(_GEMINI_IMAGE_MODEL_CACHE)} Gemini image models currently live for this key: {_GEMINI_IMAGE_MODEL_CACHE})")
-            return _GEMINI_IMAGE_MODEL_CACHE
-
-    except Exception as e:
-        print(f"      (couldn't fetch the live Gemini image-model list: {_describe_google_error(e)} -- using a fallback list)")
-
-    _GEMINI_IMAGE_MODEL_CACHE = fallback
-    return _GEMINI_IMAGE_MODEL_CACHE
-
-
-def generate_image_for_sentence(authored_prompt, out_path, width, height, api_key):
-    """
-    Returns the path on success, or None if every real option failed.
+    Returns the path on success, or None if every attempt failed.
     NEVER writes a placeholder -- a placeholder in the final video is
     treated as unacceptable output, not a fallback.
 
     `authored_prompt` comes from generate_image_prompts() -- a specific,
     contextual prompt written by an LLM that read the whole script, not a
-    generic template. We still append a technical/safety suffix here as
-    cheap defense-in-depth, but the creative content is the LLM's.
+    generic template.
 
-    Uses Gemini's image-generation models (Nano Banana family) via the same
-    API key as text generation. Nano Banana has its own "images per minute"
-    (IPM) limit on the free tier, separate from and usually stricter than the
-    text RPM limit -- so on a 429 we back off and retry the SAME model
-    (an IPM limit clears within the minute) before falling through to a
-    different model.
+    Uses Pollinations.ai -- free, no API key. Per Pollinations' own API
+    docs, tuned specifically for STRICT adherence to our already-detailed
+    prompt rather than loose/creative interpretation:
+      - enhance=false: Pollinations can optionally run your prompt through
+        an LLM to rewrite/embellish it before generating. That's meant for
+        short vague prompts ("a cat"). Ours are already long, specific, and
+        engineered against the style guide -- letting it get rewritten only
+        risks drifting away from what we actually asked for. Turned off.
+      - model=flux: Pollinations' best general-purpose, photorealistic model
+        (as opposed to "turbo", which trades quality for speed).
+      - negative=...: an explicit list of exactly the things we don't want,
+        on top of stating them in the prompt itself -- flux-based models
+        respect this as a real negative prompt, not just prompt text.
+      - nologo=true, private=true: no watermark, not shown in the public feed.
+      - safe=false: documentary/news imagery about real events shouldn't be
+        run through aggressive content filtering meant for casual use.
     """
-    import base64
     import time
+    import random
     import urllib.error
+    import urllib.parse
     import urllib.request
 
     prompt = (
         f"{authored_prompt} "
         f"photorealistic, shot on DSLR camera, natural lighting, real photography, "
-        f"no illustration, no digital art, no CGI, no text, no watermark, "
-        f"no fashion photography, no character portrait, no model posing, "
-        f"no stylized rendering, editorial photojournalism only. "
-        f"Aspect ratio matching {width}x{height}."
+        f"editorial photojournalism only."
+    )
+    negative = (
+        "illustration, digital art, cgi, 3d render, cartoon, anime, painting, "
+        "glossy, surreal, plastic looking, uncanny, watermark, logo, text, "
+        "caption, subtitle, gibberish text, blurry, deformed, extra limbs, "
+        "fashion photography, model posing, stylized rendering"
     )
 
-    candidates = [m for m in _get_gemini_image_candidates(api_key) if m not in _PERMANENTLY_UNAVAILABLE_MODELS]
+    for attempt in range(3):  # different random seed each try
+        try:
+            encoded = urllib.parse.quote(prompt)
+            seed = random.randint(1, 2_147_483_647)
+            params = {
+                "model": "flux",
+                "width": str(width),
+                "height": str(height),
+                "seed": str(seed),
+                "nologo": "true",
+                "private": "true",
+                "enhance": "false",
+                "safe": "false",
+                "negative": negative,
+            }
+            query = urllib.parse.urlencode(params)
+            url = f"https://image.pollinations.ai/prompt/{encoded}?{query}"
 
-    for model in candidates:
-        for attempt in range(2):  # a couple of tries per model, only when the wait is worth it
-            try:
-                url = (
-                    f"https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={api_key}"
-                )
-                req = urllib.request.Request(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                payload = json.dumps({
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"responseModalities": ["IMAGE"]},
-                })
-                req.data = payload.encode("utf-8")
-                with urllib.request.urlopen(req, timeout=90) as response:
-                    result = json.loads(response.read())
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            with urllib.request.urlopen(req, timeout=90) as response:
+                image_bytes = response.read()
 
-                image_bytes = None
-                for cand in result.get("candidates", []):
-                    for part in cand.get("content", {}).get("parts", []):
-                        inline = part.get("inlineData") or part.get("inline_data")
-                        if inline and inline.get("data"):
-                            image_bytes = base64.b64decode(inline["data"])
-                            break
-                    if image_bytes:
-                        break
+            if image_bytes and len(image_bytes) > 10_000:
+                with open(out_path, "wb") as f:
+                    f.write(image_bytes)
+                # Light pacing -- polite to the free service, avoids
+                # tripping any informal rate limiting.
+                time.sleep(4)
+                return out_path
+            else:
+                print(f"      [Pollinations returned suspiciously small data ({len(image_bytes) if image_bytes else 0} bytes) -- retrying with new seed]")
 
-                if image_bytes and len(image_bytes) > 5_000:
-                    with open(out_path, "wb") as f:
-                        f.write(image_bytes)
-                    # Pace proactively -- free-tier Nano Banana's images-per-
-                    # minute limit is tight, so a fixed gap between successful
-                    # generations avoids tripping it in the first place rather
-                    # than only reacting after a 429.
-                    time.sleep(8)
-                    return out_path
-                else:
-                    print(f"      [Gemini model '{model}' returned no usable image data -- trying next]")
-                    break
+        except urllib.error.HTTPError as e:
+            print(f"      [Pollinations failed: HTTP {e.code}: {e.reason} -- retrying with new seed]")
+            time.sleep(5)
+        except Exception as e:
+            print(f"      [Pollinations failed: {e} -- retrying with new seed]")
+            time.sleep(5)
 
-            except urllib.error.HTTPError as e:
-                described = _describe_google_error(e)
-                if e.code == 429:
-                    limit_is_zero, retry_after = _parse_quota_signal(described)
-                    if limit_is_zero:
-                        # Not a rate limit -- this model has NO quota on this
-                        # key at all. Waiting can never fix that. Blacklist it
-                        # permanently for the rest of this run and move on
-                        # immediately, no sleep wasted.
-                        print(f"      [model '{model}' has ZERO free-tier quota on this key -- permanently skipping it]")
-                        _PERMANENTLY_UNAVAILABLE_MODELS.add(model)
-                        break
-                    if attempt == 0 and retry_after is not None and retry_after < 30:
-                        # A real quota that will genuinely refill soon --
-                        # Google told us exactly how long, so wait that long,
-                        # not a guessed number.
-                        wait = retry_after + 1
-                        print(f"      [model '{model}' rate-limited -- Google says retry in {retry_after:.0f}s, waiting {wait:.0f}s...]")
-                        time.sleep(wait)
-                        continue
-                print(f"      [Gemini image model '{model}' failed: {described} -- trying next]")
-                break
-
-            except Exception as e:
-                print(f"      [Gemini image model '{model}' failed: {e} -- trying next]")
-                break
-
-    # --- Every Gemini image model failed or is permanently unavailable on
-    # this key today. Deliberately NO fallback to a weaker free provider here
-    # -- a lower-quality generator silently substituting for Nano Banana
-    # produces inconsistent, sometimes garbled results. Better to stop
-    # cleanly and let the person resume once quota actually refills. ---
+    # --- All attempts failed. Do NOT create a placeholder. ---
     return None
 
 
@@ -924,17 +854,6 @@ def main():
     duration = audio_clip.duration
     total_words = sum(len(s.split()) for s in sentences) or 1
 
-    gemini_key = os.environ.get("GEMINI_API_KEY")
-    if not gemini_key:
-        print(
-            "\nSTOPPED: GEMINI_API_KEY is not set, so images can't be generated.\n"
-            "Set it with: export GEMINI_API_KEY=\"your-key-here\"\n"
-            "Then run this exact same command again -- narration, audio, captions,\n"
-            "the style guide, and all written prompts are already saved and will be\n"
-            "reused automatically.\n"
-        )
-        sys.exit(1)
-
     print(f"[5/6] Generating {len(sentences)} images with Ken Burns motion...")
     beat_clips = []
     t_cursor = 0.0
@@ -958,11 +877,11 @@ def main():
             print(f"      [{i+1}/{len(sentences)}] already generated, skipping: {img_path.name}")
         else:
             print(f"      [{i+1}/{len(sentences)}] generating image for sentence {i+1}...")
-            result = generate_image_for_sentence(image_prompts[i], img_path, width, height, gemini_key)
+            result = generate_image_for_sentence(image_prompts[i], img_path, width, height)
             if result is None:
                 print(
-                    f"\nSTOPPED at sentence {i+1}/{len(sentences)}: every Gemini image model "
-                    f"failed to generate a real image for this sentence.\n"
+                    f"\nSTOPPED at sentence {i+1}/{len(sentences)}: Pollinations failed to "
+                    f"generate a real image for this sentence after multiple attempts.\n"
                     f"No placeholder was used -- nothing unusable will end up in your video.\n"
                     f"Everything completed so far (narration, music, captions, and "
                     f"{idx} earlier images) is saved in '{args.workdir}/' and will be reused automatically.\n"
